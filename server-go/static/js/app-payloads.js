@@ -4,16 +4,26 @@ app.renderPayloads = function() {
     const enc = (this._settingsData && this._settingsData.encryption) || {};
     // Payload 回连地址：优先 callback_host，为空时用 effective_callback_host（自动检测的本机IP）
     const payHost = listen.callback_host || listen.effective_callback_host || listen.detected_local_ip || '127.0.0.1';
-    const payPort = listen.port || '5000';
-    const payProto = listen.protocol || 'http';
-    // 加密设置：从配置管理读取
+    // 回连端口: HTTP/HTTPS/WebSocket 用 client_listen_port（默认 8443），TCP 用 agent_tcp_port（默认 28443）
+    const payHttpPort = listen.client_listen_port || '8443';
+    const payTcpPort = listen.agent_tcp_port || '28443';
+    // shellcode LPORT 使用 shell TCP handler 端口（默认 4444），raw TCP 流量不走 HTTP
+    const shellPort = listen.shell_listen_port || '4444';
+    // 通信协议: 从配置管理的 agent_protocol 读取（与 listen.protocol 区分）
+    // agent_protocol 是 agent 回连协议（http/https/websocket/tcp），listen.protocol 是 web 控制台协议
+    const payProto = listen.agent_protocol || 'http';
+    // 根据当前协议选择显示的端口（协议切换时通过 _onPayloadProtoChange 联动）
+    const payPortDisplay = payProto === 'tcp' ? payTcpPort : payHttpPort;
+    // 加密设置：从配置管理读取（默认值必须与后端 settings.go defaultSettings 一致）
     const encAlgo = enc.algorithm || 'aes-128-cbc';
-    const encPass = enc.password || 'c2_demo_key_2024';
+    const encPass = enc.password || 'C2DemoKey2024!!!';
     // 兼容旧值
     const encAlgoNorm = encAlgo === 'aes' ? 'aes-128-cbc' : encAlgo;
 
-    const protoOptions = ['http', 'https', 'tcp', 'websocket'].map(p =>
-        `<option value="${p}"${p === payProto ? ' selected' : ''}>${p.toUpperCase()}</option>`
+    // 通信协议选项（agent 回连协议）
+    const protoLabels = {http:'HTTP', https:'HTTPS (需SSL证书)', websocket:'WebSocket (长连接)', tcp:'TCP (独立端口, 长连接)'};
+    const protoOptions = ['http', 'https', 'websocket', 'tcp'].map(p =>
+        `<option value="${p}"${p === payProto ? ' selected' : ''}>${protoLabels[p] || p.toUpperCase()}</option>`
     ).join('');
     const encOptions = [
         {v:'aes-128-cbc', l:'AES-128-CBC'},
@@ -28,8 +38,8 @@ app.renderPayloads = function() {
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px;">
                     <div class="card" style="padding:24px;">
                         <h3 style="margin-bottom:20px; font-size:16px;"><i class="fas fa-wand-magic-sparkles" style="color:#d29922;"></i> 生成 Payload</h3>
-                        <div style="font-size:11px; color:#3fb950; padding:8px 10px; background:#0d1117; border:1px solid #238636; border-radius:6px; margin-bottom:14px;">
-                            <i class="fas fa-link"></i> 配置已同步: ${payHost}:${payPort} (${payProto.toUpperCase()}) | 加密: ${encAlgoNorm.toUpperCase()}
+                        <div id="paySyncInfo" style="font-size:11px; color:#3fb950; padding:8px 10px; background:#0d1117; border:1px solid #238636; border-radius:6px; margin-bottom:14px;">
+                            <i class="fas fa-link"></i> 配置已同步: ${payHost}:${payPortDisplay} (${payProto.toUpperCase()}) | 加密: ${encAlgoNorm.toUpperCase()}
                         </div>
                         <div style="margin-bottom:14px;">
                             <label style="font-size:12px; color:#8b949e; display:block; margin-bottom:6px;">名称</label>
@@ -60,14 +70,14 @@ app.renderPayloads = function() {
                                 <input type="text" class="input" id="payHost" value="${payHost}">
                             </div>
                             <div>
-                                <label style="font-size:12px; color:#8b949e; display:block; margin-bottom:6px;">端口 (来自配置管理)</label>
-                                <input type="text" class="input" id="payPort" value="${payPort}">
+                                <label style="font-size:12px; color:#8b949e; display:block; margin-bottom:6px;">端口 (来自配置管理, 只读)</label>
+                                <input type="text" class="input" id="payPort" value="${payPortDisplay}" readonly style="opacity:0.7; cursor:not-allowed;" title="端口由配置管理决定，HTTP/WS=${payHttpPort}, TCP=${payTcpPort}">
                             </div>
                         </div>
                         <div id="payProtoRow" style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:14px;">
                             <div>
                                 <label style="font-size:12px; color:#8b949e; display:block; margin-bottom:6px;">通信协议 (来自配置管理)</label>
-                                <select class="select" id="payProto">
+                                <select class="select" id="payProto" onchange="app._onPayloadProtoChange()">
                                     ${protoOptions}
                                 </select>
                             </div>
@@ -187,7 +197,7 @@ app.renderPayloads = function() {
                                                 <div style="font-size:11px; color:#8b949e;">${p.type} | ${p.os}/${p.arch} | ${p.protocol}</div>
                                             </div>
                                             <span class="badge badge-green" style="flex-shrink:0;">${p.encryption || 'raw'}</span>
-                                            <a href="/api/payload/download/${encodeURIComponent(p.download_filename || (p.name + '.' + (p.type === 'exe' ? 'exe' : p.type)))}?token=${window.API?.token || ''}" target="_blank" style="font-size:11px; color:#58a6ff; flex-shrink:0;" title="下载">
+                                            <a href="/api/payload/download/${encodeURIComponent(p.download_filename || (p.name + '.' + (p.type === 'exe' ? 'exe' : p.type)))}?token=${API.token || ''}" target="_blank" style="font-size:11px; color:#58a6ff; flex-shrink:0;" title="下载">
                                                 <i class="fas fa-download"></i>
                                             </a>
                                             <i class="fas fa-trash-alt" style="font-size:11px; color:#f85149; cursor:pointer; flex-shrink:0;" onclick="app.deletePayload(${p.id}, '${p.name}')" title="删除"></i>
@@ -227,7 +237,7 @@ app.renderPayloads = function() {
                                 </div>
                                 <div>
                                     <label style="font-size:11px; color:#8b949e; display:block; margin-bottom:4px;">C2地址</label>
-                                    <input type="text" class="input" id="stegoHost" value="${payHost}:${payPort}" style="font-size:12px;">
+                                    <input type="text" class="input" id="stegoHost" value="${payHost}:${payPortDisplay}" style="font-size:12px;">
                                 </div>
                             </div>
                             <div style="margin-bottom:12px;">
@@ -302,8 +312,8 @@ app.renderPayloads = function() {
                                     <input type="text" class="input" id="msfLhost" value="${payHost}" style="font-size:12px;">
                                 </div>
                                 <div>
-                                    <label style="font-size:11px; color:#8b949e; display:block; margin-bottom:4px;">LPORT (端口)</label>
-                                    <input type="text" class="input" id="msfLport" value="${payPort}" style="font-size:12px;">
+                                    <label style="font-size:11px; color:#8b949e; display:block; margin-bottom:4px;">LPORT (Shell TCP Handler 端口)</label>
+                                    <input type="text" class="input" id="msfLport" value="${shellPort}" style="font-size:12px;">
                                 </div>
                             </div>
                             <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:10px;">
@@ -428,6 +438,26 @@ app._onPayloadOsArchChange = function() {
     const os = document.getElementById('payOs')?.value;
     const arch = document.getElementById('payArch')?.value;
     this._updateCompatInfo(fmt, os, arch);
+};
+
+// 协议切换联动端口: HTTP/HTTPS/WS 用 client_listen_port，TCP 用 agent_tcp_port
+app._onPayloadProtoChange = function() {
+    const proto = document.getElementById('payProto')?.value;
+    if (!proto) return;
+    const listen = (this._settingsData && this._settingsData.listen) || {};
+    const httpPort = listen.client_listen_port || '8443';
+    const tcpPort = listen.agent_tcp_port || '28443';
+    const port = proto === 'tcp' ? tcpPort : httpPort;
+    const portInput = document.getElementById('payPort');
+    if (portInput) portInput.value = port;
+    // 更新顶部同步提示
+    const host = document.getElementById('payHost')?.value || '';
+    const enc = (this._settingsData && this._settingsData.encryption) || {};
+    const encAlgo = enc.algorithm === 'aes' ? 'aes-128-cbc' : (enc.algorithm || 'aes-128-cbc');
+    const syncBar = document.getElementById('paySyncInfo');
+    if (syncBar) {
+        syncBar.innerHTML = `<i class="fas fa-link"></i> 配置已同步: ${host}:${port} (${proto.toUpperCase()}) | 加密: ${encAlgo.toUpperCase()}`;
+    }
 };
 
 app._updateCompatInfo = function(fmt, os, arch) {
@@ -654,8 +684,10 @@ app.showCodeModal = function(filename, code, isBinary, deliveryUrl) {
     const modal = document.createElement('div');
     modal.className = 'modal-overlay';
     modal.onclick = (e) => { if (e.target === modal) modal.remove(); };
+    // 预先求值 token 并拼入 URL（onclick 在全局作用域执行，闭包内的 API 不可见）
+    const downloadUrl = `/api/payload/download/${encodeURIComponent(filename)}?token=${encodeURIComponent(API.token || '')}`;
     const downloadBtn = useDownload
-        ? `<button class="btn btn-primary" onclick="window.open('/api/payload/download/${encodeURIComponent(filename)}?token=' + (window.API?.token || ''), '_blank')"><i class="fas fa-download"></i> 下载文件</button>`
+        ? `<button class="btn btn-primary" onclick="window.open('${downloadUrl}', '_blank')"><i class="fas fa-download"></i> 下载文件</button>`
         : `<button class="btn btn-primary" onclick="app.copyCodeModal(\`${safeCode}\`)"><i class="fas fa-copy"></i> 复制代码</button>`;
     const content = useDownload
         ? `<div style="background:#0d1117; border:1px solid #21262d; border-radius:8px; padding:24px; text-align:center;">
@@ -759,7 +791,7 @@ app._refreshPayloadList = function() {
                     <div style="font-size:11px; color:#8b949e;">${p.type} | ${p.os}/${p.arch} | ${p.protocol}</div>
                 </div>
                 <span class="badge badge-green" style="flex-shrink:0;">${p.encryption || 'raw'}</span>
-                <a href="/api/payload/download/${encodeURIComponent(p.download_filename || (p.name + '.' + (p.type === 'exe' ? 'exe' : p.type)))}?token=${window.API?.token || ''}" target="_blank" style="font-size:11px; color:#58a6ff; flex-shrink:0;" title="下载">
+                <a href="/api/payload/download/${encodeURIComponent(p.download_filename || (p.name + '.' + (p.type === 'exe' ? 'exe' : p.type)))}?token=${API.token || ''}" target="_blank" style="font-size:11px; color:#58a6ff; flex-shrink:0;" title="下载">
                     <i class="fas fa-download"></i>
                 </a>
                 <i class="fas fa-trash-alt" style="font-size:11px; color:#f85149; cursor:pointer; flex-shrink:0;" onclick="app.deletePayload(${p.id}, '${p.name}')" title="删除"></i>

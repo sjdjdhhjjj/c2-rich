@@ -189,9 +189,10 @@ app.execCommand = async function() {
     // 按 task_id 精确轮询任务结果
     let attempts = 0;
     const maxAttempts = 30;
-    // WebShell 同步模式：sendTask 返回时 task 已是 completed，立即检查
+    // WebShell / Shell 同步模式：sendTask 返回时 task 已是 completed，立即检查
     const isWebshell = this.selectedClient && this.selectedClient.client_type === 'webshell';
-    const checkDelay = isWebshell ? 100 : 1200;
+    const isShell = this.selectedClient && this.selectedClient.client_type === 'shell';
+    const checkDelay = (isWebshell || isShell) ? 100 : 1200;
     const check = () => {
         attempts++;
         this.loadTasksSilent().then(() => {

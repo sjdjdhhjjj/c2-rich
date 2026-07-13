@@ -79,10 +79,13 @@ app.renderClientRow = function(c) {
         : `<span class="badge badge-red">dead</span>`;
     // WebShell 类型标识（冰蝎模式：被动等待 C2 请求）
     const isWebshell = c.client_type === 'webshell';
+    const isShell = c.client_type === 'shell';
     const typeBadge = isWebshell
         ? `<span class="badge badge-blue" title="${c.webshell_url || ''}"><i class="fas fa-globe"></i> WebShell</span>`
-        : `<span class="badge" style="background:#21262d; color:#8b949e;">Agent</span>`;
-    // WebShell 不按心跳判定离线，显示"被动"状态
+        : (isShell
+            ? `<span class="badge" style="background:#1f6feb; color:#fff;" title="reverse_tcp raw TCP"><i class="fas fa-terminal"></i> Shell</span>`
+            : `<span class="badge" style="background:#21262d; color:#8b949e;">Agent</span>`);
+    // WebShell 不按心跳判定离线，显示"被动"状态；Shell 按 conn 状态判定
     const onlineBadge = isWebshell
         ? `<span class="status-online"><span class="status-dot online"></span>被动</span>`
         : (c.status === 'online'

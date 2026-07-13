@@ -30,7 +30,15 @@ var (
 )
 
 // handleWebSocket WebSocket 升级处理器
+// 鉴权: 升级前校验 token（query 参数 ?token=xxx 或 Header）
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	// 鉴权: 未登录的连接直接拒绝，防止信息泄露
+	token := getTokenFromRequest(r)
+	if _, ok := validateToken(token); !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return // 升级失败，gorilla/websocket 会自动返回错误响应

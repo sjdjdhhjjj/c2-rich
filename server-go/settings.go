@@ -110,6 +110,9 @@ var DEFAULT_SETTINGS = map[string]string{
 	"ssl_cert":               "",
 	"ssl_key":                "",
 	"client_listen_port":     "8443",
+	"agent_protocol":         "http",
+	"agent_tcp_port":         "28443",
+	"shell_listen_port":      "44330",
 	"tunnel_port_forward":    "8888",
 	"tunnel_socks5_port":     "1080",
 	"tunnel_http_proxy_port": "8080",
@@ -181,6 +184,19 @@ func getSettingDefault(key, def string) string {
 		return def
 	}
 	return v
+}
+
+// getSettingInt 获取整型配置项，失败或为空返回默认值
+func getSettingInt(key string, def int) int {
+	v := getSetting(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
 }
 
 // setSetting 写入配置项（INSERT OR REPLACE）
@@ -372,6 +388,17 @@ func getClientListenPort() string {
 	return getSettingDefault("client_listen_port", "8443")
 }
 
+// getAgentProtocol 获取 Agent 回连服务的协议（独立于 web 控制台）
+// 默认 http，可选 https（SSL 证书共用 web 的 ssl_cert/ssl_key）
+func getAgentProtocol() string {
+	return getSettingDefault("agent_protocol", "http")
+}
+
+// getAgentTCPPort 获取 TCP Agent 回连监听端口（默认 28443，独立于 HTTP/WS）
+func getAgentTCPPort() string {
+	return getSettingDefault("agent_tcp_port", "28443")
+}
+
 // getTunnelPort 获取隧道端口
 func getTunnelPort(tunnelType string) string {
 	switch tunnelType {
@@ -421,6 +448,9 @@ func getAllSettings() map[string]interface{} {
 		"running_host":            listenHost,
 		"running_port":            listenPort,
 		"client_listen_port":      getSettingDefault("client_listen_port", "8443"),
+		"agent_protocol":          getSettingDefault("agent_protocol", "http"),
+		"agent_tcp_port":          getSettingDefault("agent_tcp_port", "28443"),
+		"shell_listen_port":       getSettingDefault("shell_listen_port", "4444"),
 		"tunnel_port_forward":     getSettingDefault("tunnel_port_forward", "8888"),
 		"tunnel_socks5_port":      getSettingDefault("tunnel_socks5_port", "1080"),
 		"tunnel_http_proxy_port":  getSettingDefault("tunnel_http_proxy_port", "8080"),
@@ -429,7 +459,7 @@ func getAllSettings() map[string]interface{} {
 	}
 	encryption := map[string]interface{}{
 		"algorithm": getSettingDefault("traffic_encryption", "aes-128-cbc"),
-		"password":  getSettingDefault("traffic_enc_password", "c2_demo_key_2024"),
+		"password":  getSettingDefault("traffic_enc_password", "C2DemoKey2024!!!"),
 		"aes_key":   getSettingDefault("traffic_aes_key", "C2DemoKey2024!!!"),
 		"xor_key":   getSettingDefault("traffic_xor_key", "c2demo"),
 	}

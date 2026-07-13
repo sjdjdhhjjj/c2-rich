@@ -63,90 +63,152 @@ app._switchSettingsTab = function(tab) {
 };
 
 // ============== 监听配置 ==============
+// 三类独立服务: HTTP/HTTPS (Web控制台+Agent回连) / TCP (Shell回连) / 内网穿透
 // 注意: web host/port/protocol/ssl_cert/ssl_key 来自根目录 config.json 文件，此处只读
-// 其余字段（callback_host / client_listen_port / tunnel_*）存在数据库，可在线编辑
+// 其余字段（callback_host / client_listen_port / agent_protocol / shell_listen_port / tunnel_*）存在数据库，可在线编辑
 app._renderListenPanel = function() {
     const l = this._settingsData.listen || {};
     return `
         <div style="max-width:680px;">
             <div style="background:#0d1117; border:1px solid #238636; border-radius:8px; padding:12px; margin-bottom:16px;">
-                <div style="color:#3fb950; font-weight:600; margin-bottom:6px;"><i class="fas fa-info-circle"></i> 监听器配置 (参考 CS Listener)</div>
+                <div style="color:#3fb950; font-weight:600; margin-bottom:6px;"><i class="fas fa-info-circle"></i> 监听器配置 (三类独立服务)</div>
                 <div style="color:#8b949e; font-size:12px; line-height:1.6;">
-                    配置服务端监听的 IP / 端口 / 协议。Payload 会回连到此地址。<br>
-                    当前运行: <code style="color:#58a6ff;">${l.running_host || '0.0.0.0'}:${l.running_port || '5000'}</code> (${(l.protocol || 'http').toUpperCase()})
+                    服务端运行三类独立监听服务，端口/协议完全分离，职责隔离:<br>
+                    <span style="color:#58a6ff;">HTTP/HTTPS</span> Web 控制台 + Agent 回连 ｜
+                    <span style="color:#f0883e;">TCP</span> Shellcode 回连 ｜
+                    <span style="color:#bc8cff;">内网穿透</span> 端口转发/SOCKS5/HTTP代理
                 </div>
             </div>
-            <div style="background:#161b22; border:1px solid #bc8cff; border-radius:8px; padding:12px; margin-bottom:16px;">
-                <div style="color:#bc8cff; font-weight:600; margin-bottom:6px;"><i class="fas fa-file-code"></i> Web 核心配置 (来自根目录 config.json)</div>
+
+            <!-- ========== Payload 回连地址（共用） ========== -->
+            <div style="background:#161b22; border:1px solid #30363d; border-radius:8px; padding:12px; margin-bottom:16px;">
+                <div style="color:#8b949e; font-weight:600; margin-bottom:8px;"><i class="fas fa-globe"></i> Payload 回连地址</div>
+                <label style="font-size:12px; color:#8b949e; display:block; margin-bottom:6px;">回连 IP（共用）</label>
+                <input type="text" class="input" id="setCallbackHost" value="${l.callback_host || ''}" placeholder="留空=自动检测 (${l.detected_local_ip || '127.0.0.1'})">
+                <div style="font-size:11px; color:#6e7681; margin-top:4px;">受害者需能访问到此 IP，留空自动用本机IP: <span style="color:#3fb950;">${l.detected_local_ip || '127.0.0.1'}</span></div>
+            </div>
+
+            <!-- ========== HTTP/HTTPS 服务 ========== -->
+            <div style="background:#0d1117; border:1px solid #58a6ff; border-radius:8px; padding:12px; margin-bottom:16px;">
+                <div style="color:#58a6ff; font-weight:600; margin-bottom:6px;"><i class="fas fa-globe"></i> HTTP/HTTPS 服务</div>
                 <div style="color:#8b949e; font-size:12px; line-height:1.6; margin-bottom:10px;">
-                    以下 4 项从根目录 <code style="color:#58a6ff;">config.json</code> 文件读取，<b style="color:#f85149;">不支持在线修改</b>。<br>
-                    请直接编辑 <code style="color:#58a6ff;">config.json</code> 后点击下方"重新加载文件配置"按钮，并重启服务。
+                    Web 控制台（管理后台）和 Agent 回连走 HTTP/HTTPS 协议，独立端口，路由完全隔离。<br>
+                    Agent 端口不暴露 <code>/api/*</code> 管理接口，Web 端口不暴露 <code>/agent/*</code> 回连端点。
                 </div>
-                <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
-                    <div>
-                        <label style="font-size:11px; color:#6e7681; display:block; margin-bottom:4px;">监听 IP (只读)</label>
-                        <input type="text" class="input" value="${l.host || '0.0.0.0'}" readonly style="opacity:0.6; cursor:not-allowed;">
+
+                <!-- Web 控制台 (config.json 只读) -->
+                <div style="background:#161b22; border:1px solid #30363d; border-radius:6px; padding:10px; margin-bottom:10px;">
+                    <div style="color:#bc8cff; font-size:12px; font-weight:600; margin-bottom:6px;">
+                        <i class="fas fa-window-maximize"></i> Web 控制台 (管理后台, config.json 只读)
                     </div>
-                    <div>
-                        <label style="font-size:11px; color:#6e7681; display:block; margin-bottom:4px;">Web 端口 (只读)</label>
-                        <input type="text" class="input" value="${l.port || '5000'}" readonly style="opacity:0.6; cursor:not-allowed;">
+                    <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px;">
+                        <div>
+                            <label style="font-size:11px; color:#6e7681; display:block; margin-bottom:4px;">监听 IP</label>
+                            <input type="text" class="input" value="${l.host || '0.0.0.0'}" readonly style="opacity:0.6; cursor:not-allowed; font-size:12px;">
+                        </div>
+                        <div>
+                            <label style="font-size:11px; color:#6e7681; display:block; margin-bottom:4px;">端口</label>
+                            <input type="text" class="input" value="${l.port || '5000'}" readonly style="opacity:0.6; cursor:not-allowed; font-size:12px;">
+                        </div>
+                        <div>
+                            <label style="font-size:11px; color:#6e7681; display:block; margin-bottom:4px;">协议</label>
+                            <input type="text" class="input" value="${(l.protocol || 'http').toUpperCase()}" readonly style="opacity:0.6; cursor:not-allowed; font-size:12px;">
+                        </div>
                     </div>
-                    <div>
-                        <label style="font-size:11px; color:#6e7681; display:block; margin-bottom:4px;">通信协议 (只读)</label>
-                        <input type="text" class="input" value="${(l.protocol || 'http').toUpperCase()}" readonly style="opacity:0.6; cursor:not-allowed;">
+                    <div style="margin-top:6px;">
+                        <label style="font-size:11px; color:#6e7681; display:block; margin-bottom:4px;">SSL 证书路径</label>
+                        <input type="text" class="input" value="${l.ssl_cert || '(未配置)'}" readonly style="opacity:0.6; cursor:not-allowed; font-size:12px;">
                     </div>
-                    <div>
-                        <label style="font-size:11px; color:#6e7681; display:block; margin-bottom:4px;">SSL 证书路径 (只读)</label>
-                        <input type="text" class="input" value="${l.ssl_cert || '(未配置)'}" readonly style="opacity:0.6; cursor:not-allowed;">
+                    <div style="margin-top:8px;">
+                        <button class="btn btn-secondary" onclick="app.reloadFileConfig()" style="font-size:12px;">
+                            <i class="fas fa-sync-alt"></i> 重新加载 config.json
+                        </button>
                     </div>
                 </div>
-                <div style="margin-top:10px;">
-                    <button class="btn btn-secondary" onclick="app.reloadFileConfig()">
-                        <i class="fas fa-sync-alt"></i> 重新加载 config.json
-                    </button>
+
+                <!-- Agent 回连 (可编辑) -->
+                <div style="background:#161b22; border:1px solid #238636; border-radius:6px; padding:10px;">
+                    <div style="color:#3fb950; font-size:12px; font-weight:600; margin-bottom:6px;">
+                        <i class="fas fa-network-wired"></i> Agent 回连 (agent/deliver, 可在线编辑)
+                    </div>
+                    <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+                        <div>
+                            <label style="font-size:11px; color:#8b949e; display:block; margin-bottom:4px;">端口</label>
+                            <input type="number" class="input" id="setClientListenPort" value="${l.client_listen_port || '8443'}" min="1" max="65535" style="font-size:12px;">
+                        </div>
+                        <div>
+                            <label style="font-size:11px; color:#8b949e; display:block; margin-bottom:4px;">协议</label>
+                            <select class="input" id="setAgentProtocol" style="font-size:12px;">
+                                <option value="http" ${(l.agent_protocol || 'http') === 'http' ? 'selected' : ''}>HTTP</option>
+                                <option value="https" ${l.agent_protocol === 'https' ? 'selected' : ''}>HTTPS (共用 web SSL 证书)</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div style="font-size:11px; color:#6e7681; margin-top:4px;">EXE/BAT/PS1 等 payload 回连此端口，/agent/* /deliver/* 端点，/ws/agent/* WebSocket 回连共用此端口</div>
                 </div>
             </div>
-            <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:14px;">
-                <div>
-                    <label style="font-size:12px; color:#8b949e; display:block; margin-bottom:6px;">Payload 回连地址</label>
-                    <input type="text" class="input" id="setCallbackHost" value="${l.callback_host || ''}" placeholder="留空=自动检测 (${l.detected_local_ip || '127.0.0.1'})">
-                    <div style="font-size:11px; color:#6e7681; margin-top:4px;">受害者需能访问到此 IP，留空自动用本机IP: <span style="color:#3fb950;">${l.detected_local_ip || '127.0.0.1'}</span></div>
+
+            <!-- ========== TCP Agent 服务 (TCP 协议 Agent 回连) ========== -->
+            <div style="background:#0d1117; border:1px solid #238636; border-radius:8px; padding:12px; margin-bottom:16px;">
+                <div style="color:#3fb950; font-weight:600; margin-bottom:6px;"><i class="fas fa-plug"></i> TCP Agent 服务</div>
+                <div style="color:#8b949e; font-size:12px; line-height:1.6; margin-bottom:10px;">
+                    TCP 协议 Agent 回连端口，独立于 HTTP/WS。<br>
+                    帧格式: <code>[4字节大端长度][base64密文]</code>，长连接，客户端轮询 pull。
                 </div>
                 <div>
-                    <label style="font-size:12px; color:#8b949e; display:block; margin-bottom:6px;">客户端监听端口 (agent 专用)</label>
-                    <input type="number" class="input" id="setClientListenPort" value="${l.client_listen_port || '8443'}" min="1" max="65535">
-                    <div style="font-size:11px; color:#6e7681; margin-top:4px;">独立于 Web 端口，减少暴露面（参考 CS 多 Listener）</div>
-                </div>
-            </div>
-            <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:14px;">
-                <div>
-                    <label style="font-size:12px; color:#8b949e; display:block; margin-bottom:6px;">内网穿透 - 端口转发</label>
-                    <input type="number" class="input" id="setTunnelPortForward" value="${l.tunnel_port_forward || '8888'}" min="1" max="65535">
-                    <div style="font-size:11px; color:#6e7681; margin-top:4px;">在目标机上监听的本地端口</div>
-                </div>
-                <div>
-                    <label style="font-size:12px; color:#8b949e; display:block; margin-bottom:6px;">内网穿透 - SOCKS5 代理</label>
-                    <input type="number" class="input" id="setTunnelSocks5" value="${l.tunnel_socks5_port || '1080'}" min="1" max="65535">
+                    <label style="font-size:11px; color:#8b949e; display:block; margin-bottom:4px;">TCP Agent 端口</label>
+                    <input type="number" class="input" id="setAgentTcpPort" value="${l.agent_tcp_port || '28443'}" min="1" max="65535" style="font-size:12px;">
+                    <div style="font-size:11px; color:#6e7681; margin-top:4px;">TCP 协议 Agent 回连端口，独立于 HTTP/WS，默认 28443</div>
                 </div>
             </div>
-            <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:14px;">
-                <div>
-                    <label style="font-size:12px; color:#8b949e; display:block; margin-bottom:6px;">内网穿透 - HTTP 代理</label>
-                    <input type="number" class="input" id="setTunnelHttpProxy" value="${l.tunnel_http_proxy_port || '8080'}" min="1" max="65535">
+
+            <!-- ========== TCP 服务 (Shellcode 回连) ========== -->
+            <div style="background:#0d1117; border:1px solid #f0883e; border-radius:8px; padding:12px; margin-bottom:16px;">
+                <div style="color:#f0883e; font-weight:600; margin-bottom:6px;"><i class="fas fa-terminal"></i> TCP 服务 (Shellcode 回连)</div>
+                <div style="color:#8b949e; font-size:12px; line-height:1.6; margin-bottom:10px;">
+                    Raw TCP 监听器，接受 reverse_tcp/bind_tcp shellcode 回连。<br>
+                    非 HTTP 协议，独立于 Web/Agent 的 HTTP 服务。参考 MSF <code>multi/handler</code>。
                 </div>
                 <div>
-                    <label style="font-size:12px; color:#8b949e; display:block; margin-bottom:6px;">测试连接</label>
-                    <button class="btn btn-secondary" onclick="app.testListenConnection()" style="width:100%;">
-                        <i class="fas fa-plug"></i> 测试当前监听
-                    </button>
+                    <label style="font-size:11px; color:#8b949e; display:block; margin-bottom:4px;">Shell TCP 端口</label>
+                    <input type="number" class="input" id="setShellListenPort" value="${l.shell_listen_port || '4444'}" min="1" max="65535" style="font-size:12px;">
+                    <div style="font-size:11px; color:#6e7681; margin-top:4px;">shellcode 的 LPORT 填此端口，上线后在主机管理可见 (type=shell)</div>
                 </div>
             </div>
+
+            <!-- ========== 内网穿透 ========== -->
+            <div style="background:#0d1117; border:1px solid #bc8cff; border-radius:8px; padding:12px; margin-bottom:16px;">
+                <div style="color:#bc8cff; font-weight:600; margin-bottom:6px;"><i class="fas fa-route"></i> 内网穿透</div>
+                <div style="color:#8b949e; font-size:12px; line-height:1.6; margin-bottom:10px;">
+                    在目标机上监听本地端口，转发流量到指定目标。
+                </div>
+                <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px;">
+                    <div>
+                        <label style="font-size:11px; color:#8b949e; display:block; margin-bottom:4px;">端口转发</label>
+                        <input type="number" class="input" id="setTunnelPortForward" value="${l.tunnel_port_forward || '8888'}" min="1" max="65535" style="font-size:12px;">
+                    </div>
+                    <div>
+                        <label style="font-size:11px; color:#8b949e; display:block; margin-bottom:4px;">SOCKS5 代理</label>
+                        <input type="number" class="input" id="setTunnelSocks5" value="${l.tunnel_socks5_port || '1080'}" min="1" max="65535" style="font-size:12px;">
+                    </div>
+                    <div>
+                        <label style="font-size:11px; color:#8b949e; display:block; margin-bottom:4px;">HTTP 代理</label>
+                        <input type="number" class="input" id="setTunnelHttpProxy" value="${l.tunnel_http_proxy_port || '8080'}" min="1" max="65535" style="font-size:12px;">
+                    </div>
+                </div>
+            </div>
+
             <div style="background:#0d1117; border:1px solid #d29922; border-radius:6px; padding:10px; margin-bottom:14px; font-size:11px; color:#d29922;">
-                <i class="fas fa-exclamation-triangle"></i> 端口冲突校验已启用: Web后台(config.json) / 客户端监听 / 内网穿透端口必须互不相同
+                <i class="fas fa-exclamation-triangle"></i> 端口冲突校验: Web控制台 / Agent回连 / Agent TCP / Shell TCP / 内网穿透端口必须互不相同。修改端口/协议后需重启服务生效。
             </div>
-            <button class="btn btn-primary" onclick="app.saveListenSettings()">
-                <i class="fas fa-save"></i> 保存监听配置
-            </button>
+            <div style="display:flex; gap:10px;">
+                <button class="btn btn-primary" onclick="app.saveListenSettings()">
+                    <i class="fas fa-save"></i> 保存监听配置
+                </button>
+                <button class="btn btn-secondary" onclick="app.testListenConnection()">
+                    <i class="fas fa-plug"></i> 测试当前监听
+                </button>
+            </div>
         </div>
     `;
 };
@@ -518,6 +580,9 @@ app.saveListenSettings = function() {
         listen: {
             callback_host: document.getElementById('setCallbackHost').value.trim(),
             client_listen_port: document.getElementById('setClientListenPort').value.trim(),
+            agent_protocol: document.getElementById('setAgentProtocol').value.trim(),
+            agent_tcp_port: document.getElementById('setAgentTcpPort').value.trim(),
+            shell_listen_port: document.getElementById('setShellListenPort').value.trim(),
             tunnel_port_forward: document.getElementById('setTunnelPortForward').value.trim(),
             tunnel_socks5_port: document.getElementById('setTunnelSocks5').value.trim(),
             tunnel_http_proxy_port: document.getElementById('setTunnelHttpProxy').value.trim(),
@@ -525,7 +590,10 @@ app.saveListenSettings = function() {
     };
     const loading = this._notify('正在保存监听配置...', 'loading', 0);
     API.put('/api/settings', data).then(res => {
-        this._notify('监听配置已保存。Web 端口/协议请编辑 config.json 后重启服务', 'success', 6000);
+        const msg = res.restart_required
+            ? '监听配置已保存，需重启服务生效（端口/协议已更改）'
+            : '监听配置已保存';
+        this._notify(msg, 'success', 6000);
         this._settingsData.listen = {...this._settingsData.listen, ...data.listen};
     }).catch(e => {
         this._notify('保存失败: ' + e.message, 'error');

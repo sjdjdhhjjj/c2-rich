@@ -2,6 +2,8 @@ package main
 
 import (
 	"crypto/md5"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"net/http"
@@ -15,6 +17,9 @@ import (
 var (
 	tokens = map[string]tokenInfo{}
 	tokensMu sync.RWMutex
+	// 登录限流: key=username, value=失败次数和锁定时间
+	loginAttempts = map[string]*loginState{}
+	loginAttemptsMu sync.Mutex
 )
 
 type tokenInfo struct {
@@ -24,15 +29,50 @@ type tokenInfo struct {
 	Expire   time.Time
 }
 
+type loginState struct {
+	FailCount int
+	LockUntil time.Time
+}
+
 // md5Hash MD5 哈希（与 crypto_utils.py md5_hash 对齐）
 func md5Hash(s string) string {
 	h := md5.Sum([]byte(s))
 	return hex.EncodeToString(h[:])
 }
 
-// generateToken 生成登录 token
+// hashPassword 密码哈希: sha256(salt + password)，存储格式 "salt$hash"
+// 比 md5 更安全，salt 防彩虹表，纯 Go 标准库无外部依赖
+func hashPassword(password string) (string, error) {
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return "", err
+	}
+	h := sha256.Sum256(append(salt, []byte(password)...))
+	return hex.EncodeToString(salt) + "$" + hex.EncodeToString(h[:]), nil
+}
+
+// verifyPassword 校验密码，支持新的 salt$hash 格式和旧的明文格式（向后兼容）
+func verifyPassword(stored, input string) bool {
+	// 新格式: salt$hash
+	if parts := strings.SplitN(stored, "$", 2); len(parts) == 2 {
+		salt, err := hex.DecodeString(parts[0])
+		if err != nil {
+			return false
+		}
+		h := sha256.Sum256(append(salt, []byte(input)...))
+		return hex.EncodeToString(h[:]) == parts[1]
+	}
+	// 旧格式: 明文（向后兼容，首次登录后会自动升级为哈希）
+	return stored == input
+}
+
+// generateToken 生成登录 token（sha256 替代 md5，增加随机性）
 func generateToken(username string, userID int64, role string) string {
-	token := md5Hash(fmt.Sprintf("%s%d", username, time.Now().UnixNano()))
+	// 加入随机字节，确保同一用户多次登录 token 不同
+	randBytes := make([]byte, 16)
+	rand.Read(randBytes)
+	h := sha256.Sum256([]byte(fmt.Sprintf("%s%d%s%d", username, userID, time.Now().UnixNano(), randBytes)))
+	token := hex.EncodeToString(h[:])
 	tokensMu.Lock()
 	tokens[token] = tokenInfo{
 		UserID:   userID,
@@ -101,6 +141,63 @@ func requireAdmin(handler func(w http.ResponseWriter, r *http.Request, user toke
 	})
 }
 
+// checkLoginLimit 检查登录限流，返回是否允许登录
+// 配置: max_login_attempts（默认 5）, login_lock_minutes（默认 15）
+func checkLoginLimit(username string) (allowed bool, retryAfter int) {
+	loginAttemptsMu.Lock()
+	defer loginAttemptsMu.Unlock()
+
+	state, ok := loginAttempts[username]
+	if !ok {
+		state = &loginState{}
+		loginAttempts[username] = state
+	}
+
+	// 锁定期内
+	if time.Now().Before(state.LockUntil) {
+		remaining := int(state.LockUntil.Sub(time.Now()).Minutes())
+		if remaining < 1 {
+			remaining = 1
+		}
+		return false, remaining
+	}
+
+	return true, 0
+}
+
+// recordLoginFail 记录登录失败
+func recordLoginFail(username string) {
+	maxAttempts := 5
+	lockMinutes := 15
+	if v := getSettingInt("max_login_attempts", 5); v > 0 {
+		maxAttempts = v
+	}
+	if v := getSettingInt("login_lock_minutes", 15); v > 0 {
+		lockMinutes = v
+	}
+
+	loginAttemptsMu.Lock()
+	defer loginAttemptsMu.Unlock()
+
+	state, ok := loginAttempts[username]
+	if !ok {
+		state = &loginState{}
+		loginAttempts[username] = state
+	}
+	state.FailCount++
+	if state.FailCount >= maxAttempts {
+		state.LockUntil = time.Now().Add(time.Duration(lockMinutes) * time.Minute)
+		state.FailCount = 0 // 锁定后重置计数
+	}
+}
+
+// recordLoginSuccess 登录成功，清除失败记录
+func recordLoginSuccess(username string) {
+	loginAttemptsMu.Lock()
+	delete(loginAttempts, username)
+	loginAttemptsMu.Unlock()
+}
+
 // getRequestIP 获取请求者 IP
 func getRequestIP(r *http.Request) string {
 	// 优先从 X-Forwarded-For 获取（代理场景）
@@ -131,20 +228,37 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 登录限流检查
+	if allowed, retryAfter := checkLoginLimit(data.Username); !allowed {
+		addLog("login", fmt.Sprintf("用户 %s 登录被锁定（尝试过多）", data.Username), "", 0, getRequestIP(r))
+		jsonError(w, fmt.Sprintf("登录尝试过多，请 %d 分钟后再试", retryAfter), http.StatusTooManyRequests)
+		return
+	}
+
 	user, err := queryOne("SELECT * FROM users WHERE username=?", data.Username)
 	if err != nil || user == nil {
+		recordLoginFail(data.Username)
 		addLog("login", fmt.Sprintf("用户 %s 登录失败", data.Username), "", 0, getRequestIP(r))
 		jsonError(w, "用户名或密码错误", http.StatusUnauthorized)
 		return
 	}
 
 	storedPwd := getString(user, "password", "")
-	if storedPwd != data.Password {
+	if !verifyPassword(storedPwd, data.Password) {
+		recordLoginFail(data.Username)
 		addLog("login", fmt.Sprintf("用户 %s 登录失败", data.Username), "", 0, getRequestIP(r))
 		jsonError(w, "用户名或密码错误", http.StatusUnauthorized)
 		return
 	}
 
+	// 密码格式升级: 如果是旧明文密码，自动升级为哈希格式
+	if !strings.Contains(storedPwd, "$") {
+		if hashed, err := hashPassword(data.Password); err == nil {
+			dbExec("UPDATE users SET password=? WHERE id=?", hashed, getInt(user, "id", 0))
+		}
+	}
+
+	recordLoginSuccess(data.Username)
 	userID := getInt(user, "id", 0)
 	role := getString(user, "role", "admin")
 	token := generateToken(data.Username, userID, role)
@@ -174,7 +288,8 @@ func handleChangePassword(w http.ResponseWriter, r *http.Request, user tokenInfo
 		jsonError(w, "用户不存在", http.StatusNotFound)
 		return
 	}
-	if getString(u, "password", "") != data.OldPassword {
+	storedPwd := getString(u, "password", "")
+	if !verifyPassword(storedPwd, data.OldPassword) {
 		jsonError(w, "原密码错误", http.StatusBadRequest)
 		return
 	}
@@ -183,7 +298,13 @@ func handleChangePassword(w http.ResponseWriter, r *http.Request, user tokenInfo
 		return
 	}
 
-	dbExec("UPDATE users SET password=? WHERE id=?", data.NewPassword, user.UserID)
+	// 新密码用哈希存储
+	hashed, err := hashPassword(data.NewPassword)
+	if err != nil {
+		jsonError(w, "密码哈希失败", http.StatusInternalServerError)
+		return
+	}
+	dbExec("UPDATE users SET password=? WHERE id=?", hashed, user.UserID)
 	addLog("settings", fmt.Sprintf("用户 %s 修改密码", user.Username), "", user.UserID, getRequestIP(r))
 	jsonOK(w, map[string]interface{}{"success": true})
 }

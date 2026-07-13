@@ -136,8 +136,135 @@ c2-rich/
 
 ### 环境要求
 
-- Go 1.21+
+- Go 1.21+（下载：https://go.dev/dl/）
 - 操作系统：Windows / Linux
+- CGO_ENABLED=0（纯 Go 编译，无需 C 编译器，依赖 modernc.org/sqlite 纯 Go 驱动）
+
+### 编译说明
+
+本项目包含两部分可编译的 Go 代码：
+
+| 源码目录 | 产物 | 说明 |
+|---------|------|------|
+| `server-go/` | `c2_server.exe`（Windows） / `c2_server`（Linux） | C2 服务端，提供 Web 控制台 + Agent 回连 + Shell TCP |
+| `client-go/` | `c2_agent.exe`（Windows） / `c2_agent_linux_amd64`（Linux） | 客户端 Agent，运行在目标机器上回连服务端 |
+
+> 编译产物默认放在各自源码目录下。服务端运行时需要 `config.json`（在项目根目录）和 `static/` 目录（在 `server-go/` 下）。
+
+#### 方式一：使用启动脚本（推荐）
+
+| 平台 | 命令 | 说明 |
+|------|------|------|
+| Windows | `c2.bat` | 自动编译服务端并前台启动 |
+| Linux | `./c2.sh build_all` | 编译服务端 + Agent（Windows EXE + Linux ELF） |
+| Linux | `./c2.sh start` | 自动编译服务端（如未编译）并后台启动 |
+
+#### 方式二：手动编译服务端
+
+**Windows（PowerShell / CMD）**：
+
+```powershell
+cd server-go
+$env:CGO_ENABLED=0; $env:GOOS="windows"; $env:GOARCH="amd64"
+go build -o c2_server.exe .
+# 产物: server-go\c2_server.exe
+```
+
+**Linux（Bash）**：
+
+```bash
+cd server-go
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o c2_server .
+# 产物: server-go/c2_server
+```
+
+#### 方式三：手动编译 Agent
+
+**Windows**：
+
+```powershell
+cd client-go
+$env:CGO_ENABLED=0; $env:GOOS="windows"; $env:GOARCH="amd64"
+go build -o c2_agent.exe .
+```
+
+**Linux**：
+
+```bash
+cd client-go
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o c2_agent_linux_amd64 .
+```
+
+#### 交叉编译（生成其他平台产物）
+
+Go 原生支持交叉编译，只需设置 `GOOS` / `GOARCH` 环境变量：
+
+**在 Windows 上编译 Linux 版服务端**：
+
+```powershell
+cd server-go
+$env:CGO_ENABLED=0; $env:GOOS="linux"; $env:GOARCH="amd64"
+go build -o c2_server_linux_amd64 .
+```
+
+**在 Linux 上编译 Windows 版服务端**：
+
+```bash
+cd server-go
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o c2_server.exe .
+```
+
+**支持的目标平台组合**：
+
+| GOOS | GOARCH | 说明 |
+|------|--------|------|
+| windows | amd64 | Windows 64 位（最常用） |
+| windows | 386 | Windows 32 位 |
+| linux | amd64 | Linux 64 位（最常用） |
+| linux | 386 | Linux 32 位 |
+| darwin | amd64 | macOS Intel |
+| darwin | arm64 | macOS Apple Silicon |
+
+#### 编译带配置注入的 Agent（ldflags）
+
+Payload 生成页面生成的 EXE 会通过 `go build -ldflags "-X ..."` 注入运行时配置（回连地址、端口、加密算法等）。手动编译时也可注入：
+
+```bash
+cd client-go
+go build -ldflags "-X main.CallbackHost=192.168.0.31 -X main.CallbackPort=18443 -X main.Protocol=websocket -X main.EncAlgo=aes-128-cbc -X main.EncPwd=C2DemoKey2024!!!" -o c2_agent_custom.exe .
+```
+
+> 正常使用推荐通过 Web 控制台的 Payload 生成页面生成 Agent，会自动处理 ldflags 注入和代码混淆。
+
+#### 运行服务端
+
+编译完成后，确保以下文件结构正确：
+
+```
+c2-rich/
+├── config.json              # 必须存在（服务端读取）
+└── server-go/
+    ├── c2_server.exe        # Windows 产物（或 c2_server / Linux）
+    └── static/              # 前端资源（必须存在）
+        ├── index.html
+        ├── css/
+        └── js/
+```
+
+运行：
+
+```powershell
+# Windows
+cd server-go
+.\c2_server.exe
+```
+
+```bash
+# Linux
+cd server-go
+chmod +x c2_server
+./c2_server
+```
 
 ### Windows 启动
 

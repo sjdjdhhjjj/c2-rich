@@ -1,18 +1,36 @@
-name: Build Builder
+name: Build with SLSA Provenance
 
 on:
-  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Generate builder
-        uses: slsa-framework/slsa-github-generator/.github/actions/generate-builder@v2.1.0
-        with:
-          repository: slsa-framework/slsa-github-generator
-          ref: refs/tags/v2.1.0
-          go-version: 1.22
+      - name: Build your artifact
+        run: |
+          # 替换为你的实际构建命令
+          echo "hello world" > artifact.txt
+
+      - name: Generate hashes
+        id: hash
+        run: |
+          echo "hashes=$(sha256sum artifact.txt | base64 -w0)" >> "$GITHUB_OUTPUT"
+
+  provenance:
+    needs: [build]
+    permissions:
+      actions: read      # 读取 workflow 元数据
+      id-token: write    # OIDC 密钥签名
+      contents: write    # 上传 Release 资产
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: "${{ needs.build.outputs.hashes }}"
+      upload-assets: true

@@ -22,8 +22,27 @@ jobs:
       - name: Build binary
         run: |
           mkdir -p dist
-          go build -o dist/server-go ./server-go
-          go build -o dist/client-go ./client-go
+          
+          # 如果根目录下没有 go.mod，先初始化一个
+          if [ ! -f "go.mod" ]; then
+            go mod init c2-rich
+          fi
+
+          # 进入 server-go 目录编译
+          cd server-go
+          if [ ! -f "go.mod" ]; then
+            go mod init server-go || true
+          fi
+          go build -o ../dist/server-go .
+          cd ..
+
+          # 进入 client-go 目录编译
+          cd client-go
+          if [ ! -f "go.mod" ]; then
+            go mod init client-go || true
+          fi
+          go build -o ../dist/client-go .
+          cd ..
 
       - name: Create archive
         run: |

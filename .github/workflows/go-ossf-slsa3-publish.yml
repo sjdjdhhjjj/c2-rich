@@ -2,7 +2,7 @@ name: Build with SLSA Provenance
 
 on:
   push:
-    tags:
+    branches:
       - main
 
 jobs:
@@ -14,22 +14,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 1. 如果你的项目需要 Go 环境，先安装 Go
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
 
-      # 2. 编译你的服务端或客户端程序（根据你的实际需求调整路径）
       - name: Build binary
         run: |
           mkdir -p dist
-          # 假设你要编译 server-go
           go build -o dist/server-go ./server-go
-          # 如果还有 client-go，也可以一起编译
           go build -o dist/client-go ./client-go
 
-      # 3. 将编译好的二进制文件打包成压缩包或直接对文件生成哈希
       - name: Create archive
         run: |
           cd dist
@@ -40,15 +35,14 @@ jobs:
         id: hash
         run: |
           cd dist
-          # 对最终要发布的压缩包计算哈希
           echo "hashes=$(sha256sum c2-rich-binaries.tar.gz | base64 -w0)" >> "$GITHUB_OUTPUT"
 
   provenance:
     needs: [build]
     permissions:
-      actions: read      # 读取 workflow 元数据
-      id-token: write    # OIDC 密钥签名
-      contents: write    # 上传 Release 资产
+      actions: read
+      id-token: write
+      contents: write
     uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
     with:
       base64-subjects: "${{ needs.build.outputs.hashes }}"

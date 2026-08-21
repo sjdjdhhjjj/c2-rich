@@ -3,7 +3,7 @@ name: Build with SLSA Provenance
 on:
   push:
     tags:
-      - 'v*'
+      - main
 
 jobs:
   build:
